@@ -52,11 +52,9 @@ def feed_key(vk: int, w_param: int) -> None:
                 STATE["held"].add(mod)
                 STATE["order"].append(mod)
         else:
+            # отпускание модификатора само по себе комбинацию не завершает:
+            # хоткей всегда «модификатор + клавиша»
             STATE["held"].discard(mod)
-            if not STATE["held"] and STATE["result"] is None:
-                order = STATE["order"]
-                if order and order != ["win"]:      # одна Win — не комбинация
-                    STATE["result"] = "+".join(order)
         return
     if down:
         if vk == VK_ESCAPE:

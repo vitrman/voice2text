@@ -44,24 +44,19 @@ def parse_hotkey(text: str) -> tuple[int, int]:
     parts = [part.strip().lower() for part in str(text).split("+") if part.strip()]
     if not parts:
         raise ValueError("пустая комбинация")
+    if len(parts) < 2:
+        raise ValueError("нужна комбинация: модификатор + клавиша")
 
-    # только модификаторы (alt+win, ctrl+alt): RegisterHotKey так не умеет,
-    # виртуальный код 0 — сигнал «ловить хуком»
-    if all(part in MODIFIERS for part in parts):
-        if len(parts) < 2:
-            raise ValueError("нужна клавиша, а не один модификатор")
-        mask = 0
-        for name in parts:
-            mask |= MODIFIERS[name]
-        return mask | MOD_NOREPEAT, 0
-
-    # одиночная клавиша разрешена (например «ё»), но она перехватывается глобально
+    # одиночная клавиша запрещена: она перехватывается глобально и перестаёт печататься
     *mods, key_name = parts
 
     mods_mask = 0
     for name in mods:
         if name not in MODIFIERS:
             raise ValueError(f"неизвестный модификатор: {name}")
+        if name == "win":
+            # Win не поддерживаем: Windows отдаёт такие сочетания системе
+            raise ValueError("Win не поддерживается, используйте Ctrl, Shift или Alt")
         mods_mask |= MODIFIERS[name]
 
     if key_name in KEYS:

@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 
 from paths import DATA, ROOT
+
+from hotkeys import parse_hotkey
+
 CONFIG_PATH = DATA / "config.json"
 
 DEFAULTS = {
@@ -49,6 +52,13 @@ class Config(dict):
         if config.get("show_hotkey") == "ctrl+alt+w":
             config["show_hotkey"] = "ctrl+shift+w"
             changed = True
+        # одиночные клавиши и мусор больше не поддерживаются: только комбинации
+        for key in ("hotkey", "show_hotkey"):
+            try:
+                parse_hotkey(config.get(key) or "")
+            except ValueError:
+                config[key] = DEFAULTS[key]
+                changed = True
         if changed:
             try:
                 config.save(path)

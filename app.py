@@ -18,8 +18,7 @@ from asr_engine import GigaAMEngine
 from clipboard import set_text as set_clipboard_text
 from config import Config
 import hotkey_capture
-from hotkeys import (MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
-                     parse_hotkey)
+from hotkeys import MOD_NOREPEAT, parse_hotkey
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
 from settings_ui import open_settings
@@ -135,14 +134,6 @@ VK_LWIN, VK_RWIN = 0x5B, 0x5C
 HOOK_EVENT = {"event": None}
 HOOK_OK = {"ok": False}
 
-# комбинации только из модификаторов (alt+win, ctrl+alt…): RegisterHotKey их не умеет,
-# поэтому ловим хуком. mask=0 — действие не на хуке.
-HOOK_MASKS = {"dictate": 0, "show": 0}
-HOOK_FIRED = {"dictate": False, "show": False}
-HOOK_CALLBACKS: dict[str, object] = {}
-MOD_VKS = {0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x10, 0xA0, 0xA1,
-           VK_LWIN, VK_RWIN}
-
 
 USER32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
 USER32.SetWindowsHookExW.restype = ctypes.c_void_p
@@ -159,46 +150,13 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
 
 
-def _pressed_mods() -> int:
-    """Какие модификаторы зажаты прямо сейчас (по состоянию клавиатуры)."""
-    mask = 0
-    for vk, bit in ((0x11, MOD_CONTROL), (0x12, MOD_ALT), (0x10, MOD_SHIFT),
-                    (VK_LWIN, MOD_WIN), (VK_RWIN, MOD_WIN)):
-        if USER32.GetAsyncKeyState(vk) & 0x8000:
-            mask |= bit
-    return mask
-
-
-def _hook_modifier(vk: int, w_param: int) -> bool:
-    """Комбинация из одних модификаторов. True — событие не пускать дальше."""
-    down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
-    mask = _pressed_mods()
-    fired = False
-    for name, want in HOOK_MASKS.items():
-        if not want:
-            continue
-        if down and mask == want and not HOOK_FIRED[name]:
-            HOOK_FIRED[name] = True
-            callback = HOOK_CALLBACKS.get(name)
-            if callback:
-                callback()
-            fired = fired or name == "dictate"
-        elif not down and mask != want:
-            HOOK_FIRED[name] = False
-    # меню Пуск не открываем, когда Win завершил комбинацию
-    return fired and vk in (VK_LWIN, VK_RWIN)
-
-
 def _hook_proc(n_code, w_param, l_param):
-    """Отпускание клавиш для рации, комбинации из модификаторов, запись комбинации."""
+    """Запись комбинации и отпускание клавиш для режима рации."""
     if n_code == 0:
         vk = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
         if hotkey_capture.is_active():
             hotkey_capture.feed_key(vk, w_param)
             return 1  # пока пишем комбинацию, клавиши не уходят в окна
-        if vk in MOD_VKS and any(HOOK_MASKS.values()):
-            if _hook_modifier(vk, w_param):
-                return 1
         if w_param in (WM_KEYUP, WM_SYSKEYUP):
             if vk in (VK_CONTROL, VK_MENU, VK_SPACE):
                 event = HOOK_EVENT["event"]
@@ -235,16 +193,15 @@ HOTKEY_FALLBACKS = {
 
 
 def apply_hotkey_specs(dictate: str, show: str) -> None:
-    """Разбирает комбинации; чисто модификаторные уходят на перехват хуком."""
+    """Разбирает комбинации в коды WinAPI (ошибка разбора — умолчание)."""
     for name, combo in (("dictate", dictate), ("show", show)):
         try:
             mods, vk = parse_hotkey(combo)
         except ValueError:
-            mods, vk = parse_hotkey(HOTKEY_FALLBACKS[name][0])
+            combo = HOTKEY_FALLBACKS[name][0]
+            mods, vk = parse_hotkey(combo)
         HOTKEY_COMBOS[name] = combo
         HOTKEY_SPECS[name] = (mods, vk)
-        HOOK_MASKS[name] = (mods & ~MOD_NOREPEAT) if vk == 0 else 0
-        HOOK_FIRED[name] = False
 
 
 def set_hotkeys(dictate: str, show: str) -> None:
@@ -256,14 +213,9 @@ def set_hotkeys(dictate: str, show: str) -> None:
 
 def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thread:
     """Глобальные горячие клавиши: диктовка и показ окна."""
-    HOOK_CALLBACKS.update(dictate=on_dictate, show=on_show)
 
     def register() -> None:
         for hotkey_id, name in ((1, "dictate"), (2, "show")):
-            if HOTKEY_SPECS[name][1] == 0:      # только модификаторы — умеет хук
-                HOTKEY_ACTUAL[name] = HOTKEY_COMBOS[name]
-                trace(f"hotkey: {name} = {HOTKEY_COMBOS[name]} (перехват хуком)")
-                continue
             candidates = [HOTKEY_COMBOS[name]] + [c for c in HOTKEY_FALLBACKS[name]
                                                   if c != HOTKEY_COMBOS[name]]
             registered = None
@@ -392,7 +344,7 @@ class App:
         top = ttk.Frame(self.root, padding=(12, 12, 12, 6))
         top.pack(fill="x")
 
-        self.btn_record = ttk.Button(top, text="● Записать (Пробел / Ctrl+Alt+Space)",
+        self.btn_record = ttk.Button(top, text=self._record_button_text(),
                                      command=self.toggle_recording, width=42)
         self.btn_record.pack(side="left")
 
@@ -451,7 +403,8 @@ class App:
             pystray.MenuItem("Спрятать в трей", lambda: self.events.put(("hide_tray", None))),
             pystray.MenuItem("Выход", lambda: self.events.put(("quit", None))),
         )
-        self.icon = pystray.Icon("voice2text", image, "Голосовой ввод — Ctrl+Alt+Space", menu)
+        self.icon = pystray.Icon("voice2text", image,
+                                 f"Голосовой ввод — {HOTKEY_ACTUAL['dictate']}", menu)
         threading.Thread(target=self.icon.run, kwargs={"setup": self._on_tray_ready},
                          daemon=True).start()
         return True
@@ -563,7 +516,7 @@ class App:
             set_hotkeys(self.config["hotkey"], self.config["show_hotkey"])
         except ValueError as exc:
             messagebox.showerror("Настройки", f"Хоткей: {exc}", parent=self.root)
-        self._apply_hook_combo()
+        self._refresh_record_button()
 
         if self.config["model"] != old_model:
             self.engine = GigaAMEngine(model_name=self.config["model"], log=self.log,
@@ -637,17 +590,34 @@ class App:
         except Exception as exc:
             self.events.put(("status", f"Модель не загрузилась: {exc}"))
 
+    def _record_button_text(self) -> str:
+        """Надпись кнопки показывает фактический хоткей, а не зашитый в код."""
+        return f"● Записать ({HOTKEY_ACTUAL['dictate']})"
+
+    def _stop_button_text(self) -> str:
+        return f"■ Стоп ({HOTKEY_ACTUAL['dictate']})"
+
+    def _refresh_record_button(self) -> None:
+        self.btn_record.configure(text=self._stop_button_text() if self.recording
+                                  else self._record_button_text())
+
     def toggle_recording(self) -> None:
+        if self.recording and self.stop_event is not None:
+            # кнопка «Стоп» на форме останавливает и рацию, и режим переключателя
+            trace("кнопка: стоп")
+            self.stop_event.set()
+            return
         if self.ptt_active and self.stop_event is not None:
-            self.stop_event.set()  # кнопка «Стоп» и меню трея останавливают рацию
+            self.stop_event.set()
             return
         if self.busy:
             return
         if not self.recording:
+            self.stop_event = threading.Event()   # без него кнопка «Стоп» не останавливает
             self._remember_target()
             self.recording = True
             self.busy = True
-            self.btn_record.configure(text="■ Стоп (Пробел)")
+            self.btn_record.configure(text=self._stop_button_text())
             self.status.set("Слушаю…")
             self.events.put(("overlay", ("Запись…", "#e05555", 15000)))
             threading.Thread(target=self._record_and_transcribe, daemon=True).start()
@@ -663,11 +633,6 @@ class App:
         if hotkey_capture.is_active():
             return
         self.events.put((kind, None))
-
-    def _apply_hook_combo(self) -> None:
-        # маски модификаторных комбинаций считает apply_hotkey_specs
-        apply_hotkey_specs(self.config.get("hotkey") or "",
-                           self.config.get("show_hotkey") or "")
 
     def on_hotkey(self) -> None:
         if self.config.get("hotkey_mode") == "hold":
@@ -797,7 +762,9 @@ class App:
                     if self.start_hidden:
                         self.hide_to_tray()
                         try:
-                            self.icon.notify("Работает в трее. Диктовка — Ctrl+Alt+Space.", "Голосовой ввод")
+                            self.icon.notify(
+                                f"Работает в трее. Диктовка — {HOTKEY_ACTUAL['dictate']}.",
+                                "Голосовой ввод")
                         except Exception:
                             pass
                 elif kind == "overlay":
@@ -819,7 +786,7 @@ class App:
                 elif kind == "quit":
                     self._quit()
                 elif kind == "reset_button":
-                    self.btn_record.configure(text="● Записать (Пробел / Ctrl+Alt+Space)")
+                    self.btn_record.configure(text=self._record_button_text())
                     self.level["value"] = 0
         except queue.Empty:
             pass

@@ -90,6 +90,34 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
             capture["after"] = None
         hotkey_capture.cancel_capture()
 
+    def _accept_combo(combo: str) -> str | None:
+        """Проверяет записанную комбинацию; текст ошибки или None."""
+        parts = [part for part in combo.lower().split("+") if part]
+        if not parts:
+            return "ничего не нажато"
+        if "win" in parts:
+            return "Win не поддерживается"
+        if len(parts) < 2:
+            return "нужна комбинация: модификатор + клавиша"
+        if not any(part in ("ctrl", "shift", "alt") for part in parts[:-1]):
+            return "добавьте Ctrl, Shift или Alt"
+        try:
+            parse_hotkey(combo)
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _apply_combo(combo: str) -> None:
+        error = _accept_combo(combo)
+        if error:
+            capture["label"].configure(text="×")
+            capture_note.configure(text=f"{error}. Старое значение оставлено.",
+                                   foreground="#b03030")
+            return
+        capture["var"].set(combo)
+        capture["label"].configure(text="✓")
+        capture_note.configure(text=f"Записано: {combo}", foreground="#2f7d32")
+
     def _hook_poll():
         combo = hotkey_capture.poll_capture()
         if combo is None:
@@ -100,10 +128,10 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
             return
         capture["after"] = None
         if combo:
-            capture["var"].set(combo)
-            capture["label"].configure(text="✓" if "+" in combo else "1")
+            _apply_combo(combo)
         else:
             capture["label"].configure(text="")
+            capture_note.configure(text="Запись отменена", foreground="#666")
 
     def _hook_timeout():
         if capture["after"] is None:
@@ -143,7 +171,7 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
         else:
             name = event.keysym.lower()
         capture["var"].set("+".join(mods + [name]))
-        capture["label"].configure(text="✓" if mods else "1")
+        _apply_combo("+".join(mods + [name]))
         window.unbind("<KeyPress>")
         return "break"
 
@@ -164,21 +192,10 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
     show_var = tk.StringVar(value=config["show_hotkey"])
     hotkey_row("Хоткей окна", show_var)
 
-    alt_win_var = tk.BooleanVar(value=config.get("hotkey", "").lower() in ("alt+win", "win+alt"))
-
-    def toggle_alt_win() -> None:
-        if alt_win_var.get():
-            dictate_var.set("alt+win")
-        else:
-            dictate_var.set("ctrl+shift+space")
-
-    ttk.Checkbutton(body, text="Диктовка по Alt+Win (перехват хуком)",
-                    variable=alt_win_var, command=toggle_alt_win).grid(
-        row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
-    row += 1
-
-    ttk.Label(body, text="Можно только модификаторы: ctrl+alt, alt+win. Запись ловит и Win.",
-              foreground="#666").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
+    capture_note = ttk.Label(
+        body, text="Комбинация: Ctrl/Shift/Alt + клавиша. Win и одиночные клавиши не поддерживаются.",
+        foreground="#666")
+    capture_note.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
     row += 1
 
     ttk.Label(body, text="Режим хоткея").grid(row=row, column=0, sticky="w", pady=(0, 2))
@@ -227,25 +244,9 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
         nonlocal result
         try:
             for var in (dictate_var, show_var):
-                if var.get().strip().lower() not in ("alt+win", "win+alt"):
-                    parse_hotkey(var.get())
+                parse_hotkey(var.get())
         except ValueError as exc:
             messagebox.showerror("Настройки", f"Хоткей: {exc}", parent=window)
-            return
-        single_key = any("+" not in var.get() for var in (dictate_var, show_var))
-        if single_key and not messagebox.askyesno(
-                "Одиночная клавиша",
-                "Клавиша без модификаторов перехватывается во всех приложениях — "
-                "её нельзя будет напечатать, пока приложение запущено.\n\nПродолжить?",
-                parent=window):
-            return
-
-        alt_in_combo = any("alt" in var.get().lower() and "win" not in var.get().lower()
-                           for var in (dictate_var, show_var))
-        if alt_in_combo and not messagebox.askyesno(
-                "Alt в комбинации",
-                "Alt открывает меню окна и может снимать фокус.\n"
-                "Надёжнее Ctrl+Shift+… Продолжить с Alt?", parent=window):
             return
         if silence_var.get() >= max_var.get() * 1000:
             messagebox.showerror("Настройки", "Пауза больше максимальной длительности",
