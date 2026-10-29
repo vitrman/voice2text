@@ -59,6 +59,9 @@ USER32.GetAncestor.restype = ctypes.c_void_p
 USER32.IsWindow.argtypes = [ctypes.c_void_p]
 USER32.IsIconic.argtypes = [ctypes.c_void_p]
 USER32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+USER32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+USER32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+USER32.BringWindowToTop.argtypes = [ctypes.c_void_p]
 USER32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
 USER32.GetWindowLongW.restype = ctypes.c_long
 USER32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
@@ -261,6 +264,7 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
 
 
 def force_foreground(hwnd: int) -> bool:
+    USER32.BringWindowToTop(hwnd)
     if USER32.SetForegroundWindow(hwnd):
         return True
     # обход блокировки смены фокуса: цепляемся к потоку текущего foreground-окна
@@ -569,10 +573,20 @@ class App:
         trace(f"own hwnd={self.hwnd}")
         self.root.after(400, self._track_foreground)
 
+    def _is_own(self, hwnd: int | None) -> bool:
+        """Окно принадлежит нашему процессу (включая рамку Tk и оверлей)."""
+        if not hwnd:
+            return False
+        if hwnd in (self.hwnd, getattr(self, "overlay_hwnd", None)):
+            return True
+        pid = ctypes.c_ulong()
+        USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return bool(pid.value) and pid.value == os.getpid()
+
     def _track_foreground(self) -> None:
         """Запоминаем последнее чужое окно — туда и будем вставлять текст."""
         hwnd = USER32.GetForegroundWindow()
-        if hwnd and hwnd != self.hwnd:
+        if hwnd and not self._is_own(hwnd):
             self.last_external = hwnd
         self.root.after(400, self._track_foreground)
 
@@ -625,8 +639,13 @@ class App:
     def _remember_target(self) -> None:
         # цель вставки — окно, активное в момент старта записи
         foreground = USER32.GetForegroundWindow()
-        self.paste_target = foreground if foreground and foreground != self.hwnd else self.last_external
-        trace(f"paste target set: {self.paste_target}")
+        if foreground and not self._is_own(foreground):
+            self.paste_target = foreground
+        else:
+            # фокус в нашем окне: берём последнее чужое, иначе вставлять некуда
+            self.paste_target = self.last_external
+        trace(f"paste target set: {self.paste_target} "
+              f"(foreground={foreground} own={self._is_own(foreground)})")
 
     def _hotkey_event(self, kind: str) -> None:
         # пока в настройках пишется комбинация, старые хоткеи не срабатывают
@@ -814,36 +833,38 @@ class App:
             self.status.set("Текст в буфере обмена — вставьте Ctrl+V")
             self.events.put(("overlay", ("Скопировано в буфер", "#4caf50", 1500)))
             return
-        target = self.paste_target or self.last_external
+        target = self.paste_target
         current = USER32.GetForegroundWindow()
         # переключились, пока говорили — вставляем туда, где пользователь сейчас
-        if current and current != self.hwnd and current != target and USER32.IsWindow(current):
+        if current and USER32.IsWindow(current) and not self._is_own(current) and current != target:
             trace(f"paste: окно сменилось, беру текущее {current}")
             target = current
-        if not target or not USER32.IsWindow(target):
-            self.status.set("Активное окно не запомнено — текст в буфере обмена")
+        if not target or self._is_own(target) or not USER32.IsWindow(target):
+            # цель оказалась нашим окном (или её нет) — берём последнее чужое
+            target = self.last_external
+        if not target or self._is_own(target) or not USER32.IsWindow(target):
+            self.status.set("Нет чужого окна для вставки — текст в буфере обмена")
             self.events.put(("overlay", ("Скопировано в буфер", "#4caf50", 1500)))
-            return
-        if target == self.hwnd:
-            # никогда не вставляем текст сами себе: это и был тот самый случай
-            self.status.set("Фокус в окне приложения — текст в буфере (Ctrl+V)")
-            self.events.put(("overlay", ("Текст в буфере", "#4caf50", 1500)))
-            return
-        if USER32.GetForegroundWindow() not in (self.hwnd, target):
-            self.status.set("Вы переключили окно — текст в буфере обмена")
-            self.events.put(("overlay", ("Окно сменилось — текст в буфере", "#e0a33a", 2000)))
             return
         # SW_RESTORE разворачивает свёрнутое окно, но заодно снимает maximise —
         # поэтому трогаем окно только если оно действительно свёрнуто
         if USER32.IsIconic(target):
             USER32.ShowWindow(target, 9)
         if not self._focus_window(target):
+            trace(f"paste: фокус не перешёл, foreground={USER32.GetForegroundWindow()}")
             self.status.set("Не удалось переключиться в окно — текст в буфере обмена")
             self.events.put(("overlay", ("Не удалось вставить — текст в буфере", "#e05555", 2500)))
             return
         time.sleep(0.05)
+        foreground = USER32.GetForegroundWindow()
+        trace(f"paste: foreground={foreground} target={target} "
+              f"own={self._is_own(foreground)} '{self._window_title(target)}'")
+        if foreground != target:
+            self.status.set("Фокус ушёл из окна вставки — текст в буфере обмена")
+            self.events.put(("overlay", ("Фокус ушёл — текст в буфере", "#e0a33a", 2000)))
+            return
         injected = send_ctrl_v()
-        trace(f"paste target={target} '{self._window_title(target)}' injected={injected}")
+        trace(f"paste target={target} injected={injected}")
         if injected:
             self.status.set("Вставлено в активное окно")
             self.events.put(("overlay", ("Вставлено", "#4caf50", 1200)))
