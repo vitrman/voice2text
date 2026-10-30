@@ -205,10 +205,17 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
                  values=["переключатель", "удерживать"]).grid(row=row, column=1, sticky="ew", pady=(0, 8))
     row += 1
 
-    ttk.Label(body, text="Пауза «конец фразы», мс").grid(row=row, column=0, sticky="w", pady=(0, 2))
+    auto_stop_var = tk.BooleanVar(value=bool(config.get("auto_stop", True)))
     silence_var = tk.IntVar(value=int(config["silence_ms"]))
-    ttk.Spinbox(body, from_=200, to=3000, increment=50, textvariable=silence_var,
-                width=10).grid(row=row, column=1, sticky="w", pady=(0, 8))
+    silence_spin = ttk.Spinbox(body, from_=200, to=5000, increment=50,
+                               textvariable=silence_var, width=10,
+                               state="normal" if auto_stop_var.get() else "disabled")
+    ttk.Checkbutton(body, text="Останавливать по паузе, мс",
+                    variable=auto_stop_var,
+                    command=lambda: silence_spin.configure(
+                        state="normal" if auto_stop_var.get() else "disabled")).grid(
+        row=row, column=0, sticky="w", pady=(0, 8))
+    silence_spin.grid(row=row, column=1, sticky="w", pady=(0, 8))
     row += 1
 
     ttk.Label(body, text="Максимум записи, с").grid(row=row, column=0, sticky="w", pady=(0, 2))
@@ -261,6 +268,7 @@ def open_settings(parent: tk.Tk, config) -> dict | None:
             "hotkey": dictate_var.get().strip().lower(),
             "show_hotkey": show_var.get().strip().lower(),
             "silence_ms": int(silence_var.get()),
+            "auto_stop": bool(auto_stop_var.get()),
             "max_seconds": int(max_var.get()),
             "hotkey_mode": "hold" if mode_var.get() == "удерживать" else "toggle",
             "autopaste": bool(autopaste_var.get()),

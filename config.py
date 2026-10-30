@@ -19,6 +19,7 @@ DEFAULTS = {
     "show_hotkey": "ctrl+shift+w",
     "hotkey_mode": "toggle",   # toggle = нажал/нажал, hold = держать
     "silence_ms": 700,
+    "auto_stop": True,         # False — писать до кнопки «Стоп»/хоткея, паузы не режут
     "max_seconds": 120,
     "chunk_seconds": 20,
     "replacements": {},        # {"как слышится": "Как надо"}

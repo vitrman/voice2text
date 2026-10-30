@@ -722,7 +722,8 @@ class App:
         try:
             audio = self.recorder.record(
                 max_seconds=float(self.config["max_seconds"]),
-                silence_ms=int(self.config["silence_ms"]),
+                silence_ms=int(self.config["silence_ms"])
+                if self.config.get("auto_stop", True) else 0,
                 on_level=self._level_cb,
                 push_to_talk=push_to_talk,
                 stop_event=self.stop_event,

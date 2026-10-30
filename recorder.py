@@ -48,7 +48,13 @@ class MicRecorder:
 
     def record(self, max_seconds: float = 25.0, silence_ms: int = 700, start_timeout: float = 8.0,
                on_level=None, push_to_talk: bool = False, stop_event=None) -> np.ndarray:
-        """push_to_talk: пишем от нажатия до отпускания, паузы внутри не режут фразу."""
+        """push_to_talk: пишем от нажатия до отпускания, паузы внутри не режут фразу.
+
+        silence_ms <= 0 — автостоп по паузам выключен, пишем до Стоп/лимита.
+        """
+        auto_stop = silence_ms > 0
+        if not auto_stop:
+            start_timeout = max_seconds   # ждать речь можно всю запись
         try:
             stream, sr = self._open_stream(TARGET_SR)
             stream.start()
@@ -121,7 +127,7 @@ class MicRecorder:
                 else:
                     collected.append(mono.copy())
                     unvoiced_run = 0 if voiced else unvoiced_run + 1
-                    if unvoiced_run >= silence_blocks:
+                    if auto_stop and unvoiced_run >= silence_blocks:
                         break
                     if stop_event is not None and stop_event.is_set():
                         break
