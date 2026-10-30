@@ -63,7 +63,16 @@ run.cmd       :: запускает приложение из исходнико
 ```bat
 release.cmd          :: exe + подпись + установщик в dist-installer
 release.cmd trust    :: то же + сертификат в доверенные (SmartScreen молчит на этой машине)
+push.cmd             :: git push origin main --tags
+push.cmd pull        :: слить удалённые коммиты и запушить
+push.cmd force       :: перезаписать удалённый main (если там ничего ценного)
+release_github.cmd   :: опубликовать Release с архивом установщика
+release_github.cmd -DryRun   :: только показать версию, тег и путь к архиву
 ```
+
+`release_github.cmd` публикует через GitHub CLI, если он установлен и выполнен `gh auth login`;
+иначе один раз спросит personal access token с правом `repo` (можно передать заранее в
+переменной `GITHUB_TOKEN`). Тег должен быть уже на GitHub — сначала `push.cmd`.
 
 По отдельности, если нужно только приложение или только установщик:
 

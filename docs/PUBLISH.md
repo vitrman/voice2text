@@ -27,7 +27,18 @@ release.cmd
 
 ## 3. Создать релиз на GitHub
 
-Веб-интерфейс:
+Одной командой:
+
+```bat
+push.cmd              :: выложить код и теги
+release_github.cmd    :: опубликовать Release с архивом установщика
+```
+
+`release_github.cmd` работает через GitHub CLI (`gh auth login`), а если `gh` нет —
+спрашивает personal access token с правом `repo` один раз за запуск.
+Проверить без публикации: `release_github.cmd -DryRun`.
+
+Вручную через веб-интерфейс:
 
 1. Страница репозитория → **Releases** (правая колонка) → **Draft a new release**.
 2. **Choose a tag** → выбрать существующий тег `v<версия>` (например `v0.7.3.1`).
