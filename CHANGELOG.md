@@ -2,6 +2,14 @@
 
 Формат версии: `MAJOR.МИНОР.ПАТЧ.1` (как у больших конфигураций, четвёртое число всегда 1).
 
+## 0.8.1.1
+- Уборка репозитория: удалены устаревшие скриншоты (`docs/gui.png`, `history.png`,
+  `live.png`, `overlay.png`, `settings.png`, `startup.png`), план `docs/plan_vstavka.md`,
+  неиспользуемый скрипт Inno Setup `installer/voice2text.iss` и старая папка `libs/`.
+- `.gitignore` приведён в порядок: сборки (`dist*`, `build*`, `dist-installer`), тестовые
+  данные (`.testdata*`), `libs/`, `_MEI*` и генерируемый тестом `docs/overlay.png`
+  не попадают в git.
+
 ## 0.8.0.1
 - Исправлена ошибка на чужих машинах `FileNotFoundError [WinError 2]` при распознавании:
   GigaAM читал WAV через внешний `ffmpeg` из PATH. Загрузчик аудио подменён на

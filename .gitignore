@@ -4,21 +4,28 @@ transcripts/
 __pycache__/
 *.pyc
 config.json
+
+# сборки и артефакты (пересобираются, в git не нужны)
 dist/
-build/
+dist2/
 dist-dbg/
-build-dbg/
 dist-final/
+dist-installer/
+build/
+build2/
+build-dbg/
 build-final/
 build-installer/
-dist-installer/
-.testdata/
-
-dist2/
-build2/
 torchinductor_vitrm/
-.testdata*/
+libs/
 *.log
+_MEI*/
+
+# данные для тестов и модели
+.testdata*/
 model/
 models/
 *.ckpt
+
+# скриншоты, которые тесты создают сами
+docs/overlay.png
