@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Вопрос по использованию
+    url: https://github.com/USER/voice2text/discussions
+    about: Если это не ошибка и не идея, спросите в Discussions.

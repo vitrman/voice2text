@@ -1,0 +1,65 @@
+name: Ошибка
+description: Что-то работает не так
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Проверьте, что в журнале `.cache/app.log` (в exe — `%LOCALAPPDATA%\voice2text\.cache\app.log`)
+        уже есть ответ: там видно хоткеи, цель вставки и ошибки распознавания.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: Что произошло
+      description: Что вы ожидали и что получилось.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить
+      placeholder: |
+        1. Открыть Блокнот
+        2. Нажать Ctrl+Shift+Space
+        3. Сказать фразу, нажать хоткей ещё раз
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия приложения
+      description: Из заголовка окна или «Справка → О программе».
+      placeholder: "0.7.1.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: Откуда запущено
+      options:
+        - Установщик (setup.exe)
+        - run.cmd из исходников
+        - Собранный exe из dist
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Версия Windows
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Последние строки журнала
+      description: Хвост `.cache/app.log` (10–30 строк) или отчёт из «Справка → Диагностика».
+      render: text
+    validations:
+      required: false
