@@ -22,7 +22,7 @@ echo [1/3] torch CPU
 uv pip install --python ".venv\Scripts\python.exe" torch torchaudio --index-url https://download.pytorch.org/whl/cpu || goto :err
 
 echo [2/3] other dependencies
-uv pip install --python ".venv\Scripts\python.exe" --no-deps numpy scipy sounddevice tqdm pyyaml omegaconf hydra-core pydub sentencepiece soundfile onnx onnxruntime packaging colorama pystray pillow six || goto :err
+uv pip install --python ".venv\Scripts\python.exe" --no-deps numpy scipy sounddevice tqdm pyyaml omegaconf hydra-core pydub sentencepiece soundfile onnx onnxruntime packaging colorama pystray pillow six customtkinter darkdetect || goto :err
 
 echo [3/3] gigaam v3 and antlr4
 ".venv\Scripts\python.exe" tools\bootstrap.py || goto :err

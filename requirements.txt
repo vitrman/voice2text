@@ -25,3 +25,5 @@ colorama
 pystray
 pillow
 six
+customtkinter
+darkdetect

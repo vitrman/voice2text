@@ -14,6 +14,8 @@ import traceback
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+import customtkinter as ctk
+
 from asr_engine import GigaAMEngine
 from clipboard import set_text as set_clipboard_text
 from config import Config
@@ -25,6 +27,18 @@ from settings_ui import open_settings
 from version import VERSION
 
 from paths import DATA, ROOT
+
+# палитра тёмной темы
+BG = "#121316"
+CARD = "#1b1d21"
+CARD_HOVER = "#23262b"
+BORDER = "#2e3238"
+ACCENT = "#4f8cff"
+ACCENT_HOVER = "#3d78e6"
+RECORD = "#e0554f"
+RECORD_HOVER = "#c84640"
+TEXT = "#f2f3f5"
+MUTED = "#8b9199"
 
 
 def _ensure_streams() -> None:
@@ -340,45 +354,57 @@ class App:
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
+        ctk.set_appearance_mode("dark")
         self.root.title(f"Голосовой ввод — GigaAM {VERSION}")
-        self.root.geometry("820x560")
-        self.root.minsize(560, 420)
+        self.root.geometry("880x620")
+        self.root.minsize(660, 480)
+        self.root.configure(fg_color=BG)
         self._build_menu()
 
-        top = ttk.Frame(self.root, padding=(12, 12, 12, 6))
-        top.pack(fill="x")
-
-        self.btn_record = ttk.Button(top, text=self._record_button_text(),
-                                     command=self.toggle_recording, width=42)
-        self.btn_record.pack(side="left")
-
-        self.level = ttk.Progressbar(top, orient="horizontal", mode="determinate", maximum=100, length=220)
-        self.level.pack(side="left", padx=12)
-
-        self.btn_copy = ttk.Button(top, text="Копировать", command=self.copy_text)
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=(18, 10))
+        ctk.CTkLabel(header, text="Голосовой ввод",
+                     font=ctk.CTkFont("Segoe UI", 20, "bold")).pack(side="left")
+        ctk.CTkLabel(header, text=f"GigaAM · {VERSION}", text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(side="left", padx=(10, 0), pady=(6, 0))
+        self.btn_copy = ctk.CTkButton(header, text="Копировать", width=116, height=34,
+                                      corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                      font=ctk.CTkFont("Segoe UI", 13), command=self.copy_text)
         self.btn_copy.pack(side="right")
-        self.btn_clear = ttk.Button(top, text="Очистить", command=self.clear_text)
-        self.btn_clear.pack(side="right", padx=6)
+        self.btn_clear = ctk.CTkButton(header, text="Очистить", width=104, height=34,
+                                       corner_radius=10, fg_color="transparent", border_width=1,
+                                       border_color=BORDER, text_color=TEXT,
+                                       hover_color=CARD_HOVER, font=ctk.CTkFont("Segoe UI", 13),
+                                       command=self.clear_text)
+        self.btn_clear.pack(side="right", padx=(0, 8))
 
-        row2 = ttk.Frame(self.root, padding=(12, 0, 12, 4))
-        row2.pack(fill="x")
+        card = ctk.CTkFrame(self.root, corner_radius=16, fg_color=CARD)
+        card.pack(fill="x", padx=20, pady=(0, 10))
+
+        self.btn_record = ctk.CTkButton(card, text=self._record_button_text(), height=46,
+                                        corner_radius=12, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                        font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                                        command=self.toggle_recording)
+        self.btn_record.pack(side="left", padx=(16, 12), pady=16)
+
+        self.level = ctk.CTkProgressBar(card, width=220, height=10, corner_radius=5,
+                                        progress_color=ACCENT, fg_color=CARD_HOVER)
+        self.level.set(0)
+        self.level.pack(side="left", padx=(0, 6))
+
         self.autopaste = tk.BooleanVar(value=bool(self.config["autopaste"]))
-        ttk.Checkbutton(row2, text="Вставлять в активное окно (Ctrl+V)",
-                        variable=self.autopaste).pack(side="left")
-        ttk.Label(row2, text="текст всегда копируется в буфер и остаётся здесь",
-                  foreground="#666").pack(side="left", padx=10)
+        ctk.CTkSwitch(card, text="Вставлять в активное окно", variable=self.autopaste,
+                      width=44, font=ctk.CTkFont("Segoe UI", 13),
+                      progress_color=ACCENT).pack(side="left", padx=(14, 16))
 
         self.status = tk.StringVar(value="Загрузка модели…")
-        ttk.Label(self.root, textvariable=self.status, padding=(12, 0, 12, 6)).pack(fill="x")
+        ctk.CTkLabel(self.root, textvariable=self.status, text_color=MUTED, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", padx=22, pady=(0, 8))
 
-        body = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        body.pack(fill="both", expand=True)
-
-        self.text = tk.Text(body, wrap="word", font=("Segoe UI", 12), undo=True)
-        self.text.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
-        scroll.pack(side="right", fill="y")
-        self.text.configure(yscrollcommand=scroll.set)
+        self.text = ctk.CTkTextbox(self.root, wrap="word", corner_radius=14,
+                                   fg_color=CARD, border_width=1, border_color=BORDER,
+                                   text_color=TEXT, font=ctk.CTkFont("Segoe UI", 15))
+        self.text.pack(fill="both", expand=True, padx=20, pady=(0, 18))
 
         self.root.bind("<space>", self._on_space)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -396,7 +422,7 @@ class App:
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
         # непрозрачная плашка: полупрозрачные иконки в трее выглядят пустыми
-        draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(198, 40, 40, 255))
+        draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(79, 140, 255, 255))
         draw.rounded_rectangle((26, 12, 38, 38), radius=6, fill=(255, 255, 255, 255))
         draw.rectangle((30, 38, 34, 46), fill=(255, 255, 255, 255))
         draw.rectangle((21, 46, 43, 51), fill=(255, 255, 255, 255))
@@ -424,14 +450,15 @@ class App:
         self.overlay.withdraw()
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
-        self.overlay.configure(bg="#202124")
+        self.overlay.configure(bg=CARD)
 
-        frame = tk.Frame(self.overlay, bg="#202124")
+        frame = tk.Frame(self.overlay, bg=CARD, highlightthickness=1,
+                         highlightbackground=BORDER)
         frame.pack(fill="both", expand=True)
-        self.overlay_dot = tk.Label(frame, text="●", font=("Segoe UI", 18), bg="#202124", fg="#e05555")
-        self.overlay_dot.pack(side="left", padx=(14, 8), pady=8)
-        self.overlay_text = tk.Label(frame, text="", font=("Segoe UI", 12), bg="#202124", fg="#f1f1f1")
-        self.overlay_text.pack(side="left", padx=(0, 16), pady=8)
+        self.overlay_dot = tk.Label(frame, text="●", font=("Segoe UI", 17), bg=CARD, fg=RECORD)
+        self.overlay_dot.pack(side="left", padx=(16, 10), pady=10)
+        self.overlay_text = tk.Label(frame, text="", font=("Segoe UI", 12), bg=CARD, fg=TEXT)
+        self.overlay_text.pack(side="left", padx=(0, 18), pady=10)
 
         self.overlay_after = None
         for widget in (self.overlay, frame, self.overlay_text, self.overlay_dot):
@@ -591,7 +618,7 @@ class App:
         self.root.after(400, self._track_foreground)
 
     def _on_space(self, event):
-        if isinstance(event.widget, (tk.Text, ttk.Entry)):
+        if isinstance(event.widget, (tk.Text, tk.Entry, ctk.CTkTextbox, ctk.CTkEntry)):
             return None
         self.toggle_recording()
         return "break"
@@ -612,8 +639,13 @@ class App:
         return f"■ Стоп ({HOTKEY_ACTUAL['dictate']})"
 
     def _refresh_record_button(self) -> None:
-        self.btn_record.configure(text=self._stop_button_text() if self.recording
-                                  else self._record_button_text())
+        self._set_record_state(self.recording)
+
+    def _set_record_state(self, recording: bool) -> None:
+        self.btn_record.configure(
+            text=self._stop_button_text() if recording else self._record_button_text(),
+            fg_color=RECORD if recording else ACCENT,
+            hover_color=RECORD_HOVER if recording else ACCENT_HOVER)
 
     def toggle_recording(self) -> None:
         if self.recording and self.stop_event is not None:
@@ -631,7 +663,7 @@ class App:
             self._remember_target()
             self.recording = True
             self.busy = True
-            self.btn_record.configure(text=self._stop_button_text())
+            self._set_record_state(True)
             self.status.set("Слушаю…")
             self.events.put(("overlay", ("Запись…", "#e05555", 15000)))
             threading.Thread(target=self._record_and_transcribe, daemon=True).start()
@@ -671,7 +703,7 @@ class App:
         self.stop_event = threading.Event()
         self.recording = True
         self.busy = True
-        self.btn_record.configure(text="● Запись…")
+        self._set_record_state(True)
         self.status.set("Слушаю… нажмите хоткей ещё раз, чтобы остановить")
         self.events.put(("overlay", ("Запись… ещё раз — стоп", "#e05555", 25000)))
         threading.Thread(target=self._record_and_transcribe, args=(False,), daemon=True).start()
@@ -693,7 +725,7 @@ class App:
         HOOK_EVENT["event"] = self.stop_event
         self.recording = True
         self.busy = True
-        self.btn_record.configure(text="● Запись…")
+        self._set_record_state(True)
         self.status.set("Слушаю… отпустите клавиши или нажмите хоткей ещё раз")
         self.events.put(("overlay", ("Запись… отпустите клавиши или нажмите хоткей ещё раз",
                                      "#e05555", 25000)))
@@ -771,7 +803,7 @@ class App:
                     else:
                         trace("text: пустая строка от модели")
                 elif kind == "level":
-                    self.level["value"] = payload
+                    self.level.set(max(0.0, min(1.0, payload / 100.0)))
                 elif kind == "error":
                     messagebox.showerror("Голосовой ввод", payload)
                 elif kind == "hotkey":
@@ -806,8 +838,8 @@ class App:
                 elif kind == "quit":
                     self._quit()
                 elif kind == "reset_button":
-                    self.btn_record.configure(text=self._record_button_text())
-                    self.level["value"] = 0
+                    self._set_record_state(False)
+                    self.level.set(0)
         except queue.Empty:
             pass
         except Exception:
@@ -953,7 +985,7 @@ def _main() -> None:
                           encoding="utf-8")
     except OSError:
         pass  # маркер нужен только для диагностики, падать из-за него нельзя
-    root = tk.Tk()
+    root = ctk.CTk()
     if already_running():
         root.withdraw()
         messagebox.showinfo("Голосовой ввод",

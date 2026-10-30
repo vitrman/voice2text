@@ -11,7 +11,7 @@ for package in ("gigaam", "pystray", "hydra", "omegaconf", "sounddevice", "sente
         pass
 
 datas = []
-for package in ("gigaam", "pystray"):
+for package in ("gigaam", "pystray", "customtkinter"):
     try:
         datas += collect_data_files(package)
     except Exception:
