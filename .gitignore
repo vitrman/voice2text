@@ -8,6 +8,9 @@ dist/
 build/
 dist-dbg/
 build-dbg/
+dist-final/
+build-final/
+build-installer/
 dist-installer/
 .testdata/
 
