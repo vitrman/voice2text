@@ -58,11 +58,19 @@ run.cmd       :: запускает приложение из исходнико
 
 ### Сборка exe и установщика
 
+Всё одной командой (приложение закрыть):
+
 ```bat
-build.cmd          :: PyInstaller + подпись -> dist\Voice2Text
-build.cmd trust    :: то же + сертификат в доверенные (SmartScreen молчит на этой машине)
+release.cmd          :: exe + подпись + установщик в dist-installer
+release.cmd trust    :: то же + сертификат в доверенные (SmartScreen молчит на этой машине)
+```
+
+По отдельности, если нужно только приложение или только установщик:
+
+```bat
+build.cmd                                          :: -> dist\Voice2Text
 .venv\Scripts\python.exe installer\build_installer.py
-                   :: -> dist-installer\Voice2Text-<версия>-installer.zip
+                                                   :: -> dist-installer\Voice2Text-<версия>-installer.zip
 ```
 
 Установщик не требует Inno Setup: `setup.exe` — обычное приложение на Python, а приложение

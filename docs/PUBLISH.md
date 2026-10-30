@@ -14,13 +14,16 @@ git push origin main --tags
 ## 2. Собрать установщик
 
 ```bat
-build.cmd
-.venv\Scripts\python.exe installer\build_installer.py
+release.cmd
 ```
 
-Результат: `dist-installer\Voice2Text-<версия>-installer.zip`.
+Скрипт собирает приложение, подписывает exe, упаковывает `payload.zip`, собирает и
+подписывает установщик. Результат: `dist-installer\Voice2Text-<версия>-installer.zip`.
 Проверка версии внутри: файл `version.txt` в папке `dist-installer`.
 В git эта папка не попадает (`.gitignore`) — архив прикладывается к релизу.
+
+Если нужно по шагам: `build.cmd`, затем
+`.venv\Scripts\python.exe installer\build_installer.py`.
 
 ## 3. Создать релиз на GitHub
 
