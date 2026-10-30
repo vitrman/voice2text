@@ -1,6 +1,6 @@
 # Voice2Text — офлайн-диктовка на GigaAM
 
-[![check](https://github.com/USER/voice2text/actions/workflows/check.yml/badge.svg)](https://github.com/USER/voice2text/actions/workflows/check.yml)
+[![check](https://github.com/vitrman/voice2text/actions/workflows/check.yml/badge.svg)](https://github.com/vitrman/voice2text/actions/workflows/check.yml)
 [![Лицензия: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Локальное распознавание русской речи с микрофона и вставка текста в любое окно Windows.

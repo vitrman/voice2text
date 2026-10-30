@@ -2,6 +2,10 @@
 
 Формат версии: `MAJOR.МИНОР.ПАТЧ.1` (как у больших конфигураций, четвёртое число всегда 1).
 
+## 0.8.2.1
+- README: бейдж CI и ссылка на Discussions указывают на реальный репозиторий `vitrman/voice2text`
+  вместо заглушки `USER`.
+
 ## 0.8.1.1
 - Уборка репозитория: удалены устаревшие скриншоты (`docs/gui.png`, `history.png`,
   `live.png`, `overlay.png`, `settings.png`, `startup.png`), план `docs/plan_vstavka.md`,

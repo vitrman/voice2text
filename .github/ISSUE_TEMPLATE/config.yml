@@ -2,4 +2,4 @@ blank_issues_enabled: false
 contact_links:
   - name: Голос в текст
     url: https://github.com/vitrman/voice2text/discussions
-    about:  
+    about: Вопросы по установке и использованию — в Discussions, ошибки и идеи — в Issues.
