@@ -127,6 +127,59 @@ def _patch_tokenizer() -> None:
 
     decoding.Tokenizer = Tokenizer
 
+def _load_audio_std(audio_path, sample_rate: int = 16_000):
+    """Читает WAV/flac сам, без внешнего ffmpeg.
+
+    Штатный gigaam.preprocess.load_audio запускает `ffmpeg` из PATH: на машине
+    без ffmpeg это FileNotFoundError (WinError 2), и распознавание не работает.
+    """
+    import numpy as np
+    import torch
+
+    mono = None
+    sr = sample_rate
+    try:
+        import soundfile as sf
+        data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+        mono = data.mean(axis=1) if data.ndim > 1 else data
+    except Exception as sf_error:
+        _log(f"soundfile не прочитал файл ({sf_error}), пробую wave")
+        with wave.open(str(audio_path), "rb") as wf:
+            sr = wf.getframerate()
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        if width == 2:
+            samples = np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
+        elif width == 1:
+            samples = (np.frombuffer(frames, dtype="u1").astype("float32") - 128.0) / 128.0
+        elif width == 4:
+            samples = np.frombuffer(frames, dtype="<i4").astype("float32") / 2147483648.0
+        else:
+            raise RuntimeError(f"неподдерживаемая разрядность WAV: {width} байт")
+        mono = samples.reshape(-1, channels).mean(axis=1) if channels > 1 else samples
+
+    if sr != sample_rate:
+        from math import gcd
+        from scipy.signal import resample_poly
+        divisor = gcd(int(sr), int(sample_rate))
+        mono = resample_poly(mono, sample_rate // divisor, sr // divisor)
+    return torch.from_numpy(np.ascontiguousarray(mono, dtype="float32")).float()
+
+
+def _patch_audio_loader() -> None:
+    """Подменяет загрузчик аудио GigaAM, чтобы не требовался ffmpeg в PATH."""
+    import gigaam.model as gigaam_model
+    import gigaam.preprocess as gigaam_preprocess
+
+    if getattr(gigaam_preprocess, "_voice2text_audio", False):
+        return
+    gigaam_preprocess.load_audio = _load_audio_std
+    gigaam_model.load_audio = _load_audio_std
+    gigaam_preprocess._voice2text_audio = True
+    _log("аудио читается через soundfile/wave, ffmpeg не нужен")
+
+
 # Порядок предпочтения: e2e-модели дают пунктуацию и регистр.
 CANDIDATES = ("v3_e2e_rnnt", "v3_e2e_ctc", "v3_rnnt", "v3_ctc", "rnnt", "ctc")
 
@@ -220,6 +273,7 @@ class GigaAMEngine:
         import gigaam  # тяжёлый импорт: torch подтягивается здесь
 
         _patch_tokenizer()
+        _patch_audio_loader()
 
         # битый или недокачанный чекпойнт gigaam не лечит — проверяем и качаем сами;
         # модель может уже лежать рядом с exe или в старом кэше, тогда берём её оттуда

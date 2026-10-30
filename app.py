@@ -23,9 +23,12 @@ import hotkey_capture
 from hotkeys import MOD_NOREPEAT, parse_hotkey
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
+import update
 from version import VERSION
 
 from paths import DATA, ROOT
+
+DEFAULT_REPO = "vitrman/voice2text"
 
 # палитра тёмной темы
 BG = "#121316"
@@ -99,11 +102,19 @@ LOG = DATA / ".cache" / "app.log"
 
 
 def trace(message: str) -> None:
+    """Пишет строку в app.log; при разрастании уводит старый файл в app.log.1."""
     try:
+        if LOG.exists() and LOG.stat().st_size > 2_000_000:
+            LOG.replace(LOG.with_suffix(".log.1"))
         with open(LOG, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except OSError:
         pass
+
+
+def trace_exc(message: str) -> None:
+    """Строка об ошибке вместе с трассировкой — по ней видно, где именно упало."""
+    trace(f"{message}: {traceback.format_exc().rstrip()}")
 
 
 USER32 = ctypes.windll.user32
@@ -383,6 +394,7 @@ class App:
         self._applying = False
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
+        self._log_environment()
         self.root.report_callback_exception = self._ui_exception
         self._build_ui()
         self.root.after(80, self._drain_events)
@@ -398,6 +410,63 @@ class App:
                               lambda name, combo: self.events.put(("hotkey_changed", (name, combo))))
         start_keyboard_hook()
         self._setup_tray()
+        if self.config.get("check_updates", True):
+            self.root.after(15000, lambda: self.check_updates(silent=True))
+
+    # ---------- обновления ----------
+    def check_updates(self, silent: bool = False) -> None:
+        if update.current_target() is None and not silent:
+            self.status.set("Обновление доступно только для установленной версии")
+            return
+        repo = self.config.get("github_repo") or DEFAULT_REPO
+
+        def worker() -> None:
+            try:
+                info = update.check(repo, VERSION)
+            except Exception as exc:
+                trace_exc("проверка обновлений")
+                if not silent:
+                    self.events.put(("status", f"Не удалось проверить обновления: {exc}"))
+                return
+            if info is None:
+                if not silent:
+                    self.events.put(("status", f"Обновлений нет: {VERSION} — последняя версия"))
+                return
+            trace(f"обновление доступно: {info['version']} ({info['size'] / 1e6:.0f} МБ)")
+            self.events.put(("update_ready", info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _offer_update(self, info: dict) -> None:
+        size = (info.get("size") or 0) / 1e6
+        pages = f"\n\n{info['page']}" if info.get("page") else ""
+        if not messagebox.askyesno(
+                "Обновление",
+                f"Доступна версия {info['version']} (установлена {VERSION}).\n"
+                f"Скачать {size:.0f} МБ и установить? Приложение перезапустится.{pages}",
+                parent=self.root):
+            return
+        self.status.set(f"Скачивание обновления {info['version']}…")
+        threading.Thread(target=self._download_update, args=(info,), daemon=True).start()
+
+    def _download_update(self, info: dict) -> None:
+        def progress(done: int, total: int) -> None:
+            if not total:
+                return
+            percent = done * 100 // total
+            self.events.put(("status", f"Скачивание обновления: {percent}% "
+                                       f"({done / 1e6:.0f} из {total / 1e6:.0f} МБ)"))
+
+        try:
+            archive = update.download(info["url"], info["name"], progress)
+            self.events.put(("status", "Установка обновления…"))
+            update.apply(archive, update.current_target())
+        except Exception as exc:
+            trace_exc("установка обновления")
+            self.events.put(("status", f"Обновление не установлено: {exc}"))
+            return
+        trace("обновление запущено, закрываю приложение")
+        self.root.after(800, self._quit)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -820,10 +889,50 @@ class App:
         menubar.add_cascade(label="Файл", menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Проверить обновления…", command=self.check_updates)
+        help_menu.add_separator()
         help_menu.add_command(label="Диагностика", command=self.run_diagnostics)
+        help_menu.add_command(label="Открыть журнал", command=self.open_log)
+        help_menu.add_command(label="Открыть папку данных", command=self.open_data_folder)
         help_menu.add_command(label="О программе", command=self.show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
         self.root.config(menu=menubar)
+
+    def open_log(self) -> None:
+        try:
+            os.startfile(str(LOG))  # noqa: S606 — Windows открывает файл своим просмотрщиком
+        except OSError as exc:
+            self.status.set(f"Не удалось открыть журнал: {exc}")
+
+    def open_data_folder(self) -> None:
+        try:
+            os.startfile(str(DATA))  # noqa: S606
+        except OSError as exc:
+            self.status.set(f"Не удалось открыть папку: {exc}")
+
+    def _log_environment(self) -> None:
+        """Паспорт машины в журнале — без него чужие логи бесполезны."""
+        import platform
+        import shutil
+
+        from asr_engine import MODEL_DIR
+
+        try:
+            trace(f"версия {VERSION}; frozen={getattr(sys, 'frozen', False)}; exe={sys.executable}")
+            trace(f"python {platform.python_version()}; {platform.platform()}")
+            trace(f"cwd={os.getcwd()}; ROOT={ROOT}; DATA={DATA}")
+            trace(f"ffmpeg={'есть' if shutil.which('ffmpeg') else 'нет'} (не требуется)")
+            trace(f"админ={bool(ctypes.windll.shell32.IsUserAnAdmin())}")
+            trace(f"свободно {shutil.disk_usage(str(DATA)).free / 2**30:.1f} ГБ в {DATA}")
+            trace(f"модель {self.engine.name}; каталог {MODEL_DIR}")
+            try:
+                from recorder import list_input_devices
+                devices = list_input_devices()
+                trace(f"микрофоны ({len(devices)}): {'; '.join(devices) or 'нет'}")
+            except Exception as exc:
+                trace(f"список микрофонов недоступен: {exc!r}")
+        except Exception:
+            trace_exc("не удалось записать паспорт окружения")
 
     def run_diagnostics(self) -> None:
         log_tail = ""
@@ -1041,13 +1150,14 @@ class App:
                 self.events.put(("status", "Речь не распознана — тишина или шум"))
                 self.events.put(("overlay", ("Ничего не распознано", "#e0a33a", 2000)))
         except RecorderError as exc:
-            trace(f"recorder error: {exc}")
+            trace_exc("recorder error")
             self.events.put(("status", str(exc)))
             self.events.put(("overlay", (str(exc)[:60], "#e05555", 2500)))
         except Exception as exc:
-            trace(f"transcribe error: {exc!r}")
+            # трассировка обязательна: по одному сообщению WinError причина не видна
+            trace_exc(f"transcribe error ({type(exc).__name__})")
             self.events.put(("status", f"Ошибка распознавания: {exc}"))
-            self.events.put(("error", f"Не удалось распознать:\n{exc}"))
+            self.events.put(("error", f"Не удалось распознать:\n{exc}\n\nПодробности — в журнале:\n{LOG}"))
         finally:
             HOOK_EVENT["event"] = None
             self.recording = False
@@ -1089,6 +1199,8 @@ class App:
                                 "Голосовой ввод")
                         except Exception:
                             pass
+                elif kind == "update_ready":
+                    self._offer_update(payload)
                 elif kind == "overlay":
                     self._overlay_show(*payload)
                 elif kind == "hotkey_changed":

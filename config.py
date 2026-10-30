@@ -24,6 +24,8 @@ DEFAULTS = {
     "chunk_seconds": 20,
     "replacements": {},        # {"как слышится": "Как надо"}
     "start_minimized": True,
+    "check_updates": True,     # искать новую версию на GitHub при запуске
+    "github_repo": "vitrman/voice2text",
 }
 
 

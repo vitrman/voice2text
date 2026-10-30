@@ -48,7 +48,8 @@ Windows покажет SmartScreen (сборка подписана самопо
 
 ### Из исходников
 
-Нужны Python 3.12, [uv](https://docs.astral.sh/uv/) и `ffmpeg` в `PATH`.
+Нужны Python 3.12 и [uv](https://docs.astral.sh/uv/). `ffmpeg` не требуется: аудио читается
+через `soundfile`/`wave`.
 
 ```bat
 install.cmd   :: создаёт .venv и ставит зависимости
@@ -98,16 +99,29 @@ build.cmd trust    :: то же + сертификат в доверенные (
 | `config.py`, `paths.py` | настройки и пути данных |
 | `clipboard.py` | системный буфер обмена через WinAPI |
 | `postprocess.py` | замены, чистка текста |
+| `update.py` | проверка и установка обновлений из GitHub Releases |
 | `installer/` | установщик и его сборка |
 
 Данные лежат рядом с исходниками (в exe — в `%LOCALAPPDATA%\voice2text`): `config.json`,
 `.cache\gigaam` с моделью, `.cache\app.log` с журналом.
 
+## Обновление
+
+Приложение само проверяет новый релиз на GitHub через 15 секунд после старта (ключ
+`check_updates`) и по меню **Справка → Проверить обновления…**. Если версия новее —
+предлагает скачать `*-installer.zip` из Assets релиза, ставит его в тихом режиме
+поверх текущей папки и перезапускается. Конфиг, модель и журналы лежат в
+`%LOCALAPPDATA%` и при обновлении не трогаются.
+
+Репозиторий для проверки задаётся ключом `github_repo` (по умолчанию
+`vitrman/voice2text`). Обновление работает только для установленной версии; при запуске
+из исходников пункт меню сообщает об этом.
+
 ## Настройки
 
 `config.json`: `model`, `device` (индекс микрофона или `null`), `hotkey`, `show_hotkey`,
 `hotkey_mode` (`toggle`/`hold`), `silence_ms`, `auto_stop`, `max_seconds`, `chunk_seconds`,
-`autopaste`, `start_minimized`, `replacements`.
+`autopaste`, `start_minimized`, `replacements`, `check_updates`, `github_repo`.
 
 ## Если что-то не работает
 

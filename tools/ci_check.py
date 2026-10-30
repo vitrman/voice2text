@@ -10,11 +10,16 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import hotkeys  # noqa: E402
+import update  # noqa: E402
 import version  # noqa: E402
 
 
 def main() -> int:
     assert re.fullmatch(r"\d+\.\d+\.\d+\.1", version.VERSION), version.VERSION
+
+    assert update.version_tuple("v0.7.3.1") == (0, 7, 3, 1)
+    assert update.version_tuple("0.8") == (0, 8, 0, 0)
+    assert update.version_tuple("0.7.3.1") < update.version_tuple("0.8.0.1")
 
     assert hotkeys.parse_hotkey("ctrl+shift+space") == (16390, 32)
     assert hotkeys.parse_hotkey("alt+f9") == (16385, 120)

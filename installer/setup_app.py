@@ -181,6 +181,8 @@ def run_silent(arguments: list[str]) -> int:
     target = default_target()
     icons = registry = launch = True
     for arg in arguments:
+        # путь может прийти в кавычках: "/D=C:\Program Files\Voice2Text"
+        arg = arg.strip('"')
         low = arg.lower()
         if low.startswith("/d="):
             target = Path(arg[3:].strip('"'))

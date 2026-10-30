@@ -14,6 +14,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Синтаксис
-        run: python -m compileall -q app.py asr_engine.py recorder.py config.py paths.py postprocess.py clipboard.py hotkeys.py hotkey_capture.py model_fetch.py cli.py installer tools
+        run: python -m compileall -q app.py asr_engine.py recorder.py config.py paths.py postprocess.py clipboard.py hotkeys.py hotkey_capture.py model_fetch.py update.py cli.py installer tools
       - name: Проверки без модели
         run: python tools/ci_check.py
