@@ -370,6 +370,55 @@ def send_ctrl_v() -> bool:
     return False
 
 
+class UpdateDialog(ctk.CTkToplevel):
+    """Небольшое окно с прогрессом скачивания и кнопкой отмены."""
+
+    def __init__(self, master, version: str, on_cancel) -> None:
+        super().__init__(master)
+        self.title("Обновление")
+        self.geometry("430x180")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.attributes("-topmost", True)
+        self._on_cancel = on_cancel
+        self._closed = False
+
+        ctk.CTkLabel(self, text=f"Скачивание Voice2Text {version}", anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 15, "bold")).pack(
+            fill="x", padx=20, pady=(18, 4))
+        self.info = ctk.CTkLabel(self, text="0 %", anchor="w", text_color=MUTED,
+                                 font=ctk.CTkFont("Segoe UI", 12))
+        self.info.pack(fill="x", padx=20)
+        self.bar = ctk.CTkProgressBar(self, height=10, corner_radius=5,
+                                      progress_color=ACCENT, fg_color=CARD_HOVER)
+        self.bar.set(0)
+        self.bar.pack(fill="x", padx=20, pady=12)
+        ctk.CTkButton(self, text="Отмена", width=120, height=32, corner_radius=9,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      text_color=TEXT, hover_color=CARD,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self._cancel).pack(anchor="e", padx=20, pady=(0, 16))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.after(50, self.lift)
+
+    def set_progress(self, done: int, total: int) -> None:
+        if self._closed:
+            return
+        if total:
+            self.bar.set(min(1.0, done / total))
+            self.info.configure(text=f"{done / 1e6:.0f} из {total / 1e6:.0f} МБ "
+                                     f"({done * 100 // total} %)")
+        else:
+            self.info.configure(text=f"{done / 1e6:.0f} МБ")
+
+    def _cancel(self) -> None:
+        self._closed = True
+        try:
+            self._on_cancel()
+        finally:
+            self.destroy()
+
+
 class App:
     def __init__(self, root: tk.Tk, config: Config | None = None):
         self.root = root
@@ -392,6 +441,10 @@ class App:
         self._capture = None          # активная запись комбинации в панели
         self._apply_after = None      # отложенное применение настроек
         self._applying = False
+        self._update_busy = False     # проверка/скачивание уже идёт
+        self._update_cancel = None
+        self._update_info = None
+        self._update_dialog = None
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self._log_environment()
@@ -433,6 +486,10 @@ class App:
         if update.current_target() is None and not silent:
             self.status.set("Обновление доступно только для установленной версии")
             return
+        if self._update_busy:
+            if not silent:
+                self.status.set("Обновление уже проверяется или скачивается")
+            return
         repo = self.config.get("github_repo") or DEFAULT_REPO
 
         def worker() -> None:
@@ -459,34 +516,72 @@ class App:
 
     def _offer_update(self, info: dict) -> None:
         size = (info.get("size") or 0) / 1e6
-        pages = f"\n\n{info['page']}" if info.get("page") else ""
-        if not messagebox.askyesno(
-                "Обновление",
-                f"Доступна версия {info['version']} (установлена {VERSION}).\n"
-                f"Скачать {size:.0f} МБ и установить? Приложение перезапустится.{pages}",
-                parent=self.root):
+        ready = update.cached(info["name"], info.get("size") or 0)
+        if ready is not None:
+            question = (f"Версия {info['version']} уже скачана "
+                        f"({ready.stat().st_size / 1e6:.0f} МБ). Установить сейчас?\n"
+                        f"Приложение перезапустится.")
+        else:
+            question = (f"Доступна версия {info['version']} (установлена {VERSION}).\n"
+                        f"Скачать {size:.0f} МБ и установить? Приложение перезапустится.")
+        if info.get("page"):
+            question += f"\n\n{info['page']}"
+        if not messagebox.askyesno("Обновление", question, parent=self.root):
             return
-        self.status.set(f"Скачивание обновления {info['version']}…")
+        self._update_busy = True
+        self._update_info = info
+        self._update_cancel = threading.Event()
+        if ready is not None:
+            self._install_update(ready)
+            return
+        self._update_dialog = UpdateDialog(self.root, info["version"], self._cancel_update)
         threading.Thread(target=self._download_update, args=(info,), daemon=True).start()
+
+    def _cancel_update(self) -> None:
+        if self._update_cancel is not None:
+            self._update_cancel.set()
+        trace("обновление: отмена скачивания")
 
     def _download_update(self, info: dict) -> None:
         def progress(done: int, total: int) -> None:
-            if not total:
-                return
-            percent = done * 100 // total
-            self.events.put(("status", f"Скачивание обновления: {percent}% "
-                                       f"({done / 1e6:.0f} из {total / 1e6:.0f} МБ)"))
+            self.events.put(("update_progress", (done, total)))
 
         try:
-            archive = update.download(info["url"], info["name"], progress)
-            self.events.put(("status", "Установка обновления…"))
-            update.apply(archive, update.current_target())
+            archive = update.download(info["url"], info["name"], progress,
+                                      cancel=self._update_cancel,
+                                      expected_size=info.get("size") or 0)
+        except update.UpdateCancelled:
+            self.events.put(("update_cancelled", None))
+            return
+        except Exception as exc:
+            trace_exc("скачивание обновления")
+            self.events.put(("update_failed", str(exc)))
+            return
+        self.events.put(("update_downloaded", archive))
+
+    def _install_update(self, archive) -> None:
+        try:
+            helper = update.apply(archive, update.current_target(), pid=os.getpid())
         except Exception as exc:
             trace_exc("установка обновления")
-            self.events.put(("status", f"Обновление не установлено: {exc}"))
+            self._update_busy = False
+            self._close_update_dialog()
+            self.status.set(f"Обновление не установлено: {exc}")
+            messagebox.showerror("Обновление",
+                                 f"Не удалось запустить установку:\n{exc}", parent=self.root)
             return
-        trace("обновление запущено, закрываю приложение")
-        self.root.after(800, self._quit)
+        trace(f"обновление запущено через {helper}, закрываю приложение")
+        self._close_update_dialog()
+        self.status.set("Установка обновления — приложение перезапустится")
+        self.root.after(600, self._quit)
+
+    def _close_update_dialog(self) -> None:
+        if self._update_dialog is not None:
+            try:
+                self._update_dialog.destroy()
+            except Exception:
+                pass
+            self._update_dialog = None
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -1221,6 +1316,24 @@ class App:
                             pass
                 elif kind == "update_ready":
                     self._offer_update(payload)
+                elif kind == "update_progress":
+                    done, total = payload
+                    if self._update_dialog is not None:
+                        self._update_dialog.set_progress(done, total)
+                elif kind == "update_downloaded":
+                    self._close_update_dialog()
+                    self._install_update(payload)
+                elif kind == "update_cancelled":
+                    self._close_update_dialog()
+                    self._update_busy = False
+                    self.status.set("Скачивание обновления отменено")
+                elif kind == "update_failed":
+                    self._close_update_dialog()
+                    self._update_busy = False
+                    self.status.set(f"Обновление не скачалось: {payload}")
+                    messagebox.showerror("Обновление",
+                                         f"Не удалось скачать обновление:\n{payload}",
+                                         parent=self.root)
                 elif kind == "overlay":
                     self._overlay_show(*payload)
                 elif kind == "hotkey_changed":

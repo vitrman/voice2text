@@ -134,12 +134,23 @@ def extract(payload: Path, target: Path, progress) -> None:
 def install(target: Path, *, icons: bool, registry: bool, progress) -> Path:
     payload = payload_file()
     version = app_version()
-    if target.exists():
-        # старая версия: сначала пробуем удалить, чтобы не оставить мусор
-        if (target / EXE_NAME).exists():
-            shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
-    extract(payload, target, progress)
+    # Папку не удаляем: при обновлении ставим поверх, иначе занятые файлы ломают установку.
+    old_exe = target / (EXE_NAME + ".old")
+    if (target / EXE_NAME).exists():
+        try:
+            old_exe.unlink(missing_ok=True)
+            (target / EXE_NAME).rename(old_exe)
+        except PermissionError as exc:
+            raise RuntimeError("Приложение запущено. Закройте его и повторите установку.") from exc
+    try:
+        extract(payload, target, progress)
+    except Exception:
+        # не оставляем пользователя без приложения, если распаковка сорвалась
+        if old_exe.exists() and not (target / EXE_NAME).exists():
+            old_exe.rename(target / EXE_NAME)
+        raise
+    old_exe.unlink(missing_ok=True)
     progress(1.0, "Файлы распакованы")
     exe = target / EXE_NAME
     shortcuts: list[Path] = []
