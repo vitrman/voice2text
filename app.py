@@ -23,7 +23,6 @@ import hotkey_capture
 from hotkeys import MOD_NOREPEAT, parse_hotkey
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
-from settings_ui import open_settings
 from version import VERSION
 
 from paths import DATA, ROOT
@@ -39,6 +38,51 @@ RECORD = "#e0554f"
 RECORD_HOVER = "#c84640"
 TEXT = "#f2f3f5"
 MUTED = "#8b9199"
+
+MODELS = ["v3_e2e_rnnt", "v3_e2e_ctc", "v3_rnnt", "v3_ctc"]
+
+
+def _input_devices() -> list[str]:
+    try:
+        from recorder import list_input_devices
+        return ["По умолчанию"] + list_input_devices()
+    except Exception:
+        return ["По умолчанию"]
+
+
+def _replacements_to_text(replacements: dict) -> str:
+    return "\n".join(f"{src} = {dst}" for src, dst in replacements.items())
+
+
+def _text_to_replacements(text: str) -> dict:
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        source, target = line.split("=", 1)
+        source, target = source.strip(), target.strip()
+        if source and target:
+            result[source] = target
+    return result
+
+
+def _combo_error(combo: str) -> str | None:
+    """Проверка записанной комбинации: текст ошибки или None."""
+    parts = [part for part in combo.lower().split("+") if part]
+    if not parts:
+        return "ничего не нажато"
+    if "win" in parts:
+        return "Win не поддерживается"
+    if len(parts) < 2:
+        return "нужна комбинация: модификатор + клавиша"
+    if not any(part in ("ctrl", "shift", "alt") for part in parts[:-1]):
+        return "добавьте Ctrl, Shift или Alt"
+    try:
+        parse_hotkey(combo)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _ensure_streams() -> None:
@@ -334,6 +378,9 @@ class App:
         self.quitting = False
         self.start_hidden = False
         self.tray_ready = False
+        self._capture = None          # активная запись комбинации в панели
+        self._apply_after = None      # отложенное применение настроек
+        self._applying = False
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self.root.report_callback_exception = self._ui_exception
@@ -356,13 +403,21 @@ class App:
     def _build_ui(self) -> None:
         ctk.set_appearance_mode("dark")
         self.root.title(f"Голосовой ввод — GigaAM {VERSION}")
-        self.root.geometry("880x620")
-        self.root.minsize(660, 480)
+        self.root.geometry("1240x720")
+        self.root.minsize(980, 560)
         self.root.configure(fg_color=BG)
         self._build_menu()
 
-        header = ctk.CTkFrame(self.root, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(18, 10))
+        main = ctk.CTkFrame(self.root, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=20, pady=(16, 18))
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(main, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+
+        header = ctk.CTkFrame(left, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(header, text="Голосовой ввод",
                      font=ctk.CTkFont("Segoe UI", 20, "bold")).pack(side="left")
         ctk.CTkLabel(header, text=f"GigaAM · {VERSION}", text_color=MUTED,
@@ -378,8 +433,8 @@ class App:
                                        command=self.clear_text)
         self.btn_clear.pack(side="right", padx=(0, 8))
 
-        card = ctk.CTkFrame(self.root, corner_radius=16, fg_color=CARD)
-        card.pack(fill="x", padx=20, pady=(0, 10))
+        card = ctk.CTkFrame(left, corner_radius=16, fg_color=CARD)
+        card.pack(fill="x", pady=(0, 10))
 
         self.btn_record = ctk.CTkButton(card, text=self._record_button_text(), height=46,
                                         corner_radius=12, fg_color=ACCENT, hover_color=ACCENT_HOVER,
@@ -387,28 +442,267 @@ class App:
                                         command=self.toggle_recording)
         self.btn_record.pack(side="left", padx=(16, 12), pady=16)
 
-        self.level = ctk.CTkProgressBar(card, width=220, height=10, corner_radius=5,
+        self.level = ctk.CTkProgressBar(card, width=200, height=10, corner_radius=5,
                                         progress_color=ACCENT, fg_color=CARD_HOVER)
         self.level.set(0)
         self.level.pack(side="left", padx=(0, 6))
 
         self.autopaste = tk.BooleanVar(value=bool(self.config["autopaste"]))
         ctk.CTkSwitch(card, text="Вставлять в активное окно", variable=self.autopaste,
-                      width=44, font=ctk.CTkFont("Segoe UI", 13),
-                      progress_color=ACCENT).pack(side="left", padx=(14, 16))
+                      width=44, font=ctk.CTkFont("Segoe UI", 13), progress_color=ACCENT,
+                      command=self._schedule_apply).pack(side="left", padx=(14, 16))
 
         self.status = tk.StringVar(value="Загрузка модели…")
-        ctk.CTkLabel(self.root, textvariable=self.status, text_color=MUTED, anchor="w",
-                     font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", padx=22, pady=(0, 8))
+        ctk.CTkLabel(left, textvariable=self.status, text_color=MUTED, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", pady=(0, 8))
 
-        self.text = ctk.CTkTextbox(self.root, wrap="word", corner_radius=14,
+        self.text = ctk.CTkTextbox(left, wrap="word", corner_radius=14,
                                    fg_color=CARD, border_width=1, border_color=BORDER,
                                    text_color=TEXT, font=ctk.CTkFont("Segoe UI", 15))
-        self.text.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+        self.text.pack(fill="both", expand=True)
+
+        self.settings_panel = ctk.CTkScrollableFrame(main, width=372, corner_radius=16,
+                                                     fg_color=CARD)
+        self.settings_panel.grid(row=0, column=1, sticky="ns")
+        self._build_settings_panel(self.settings_panel)
 
         self.root.bind("<space>", self._on_space)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._remember_own_hwnd)
+
+    # ---------- панель настроек ----------
+    def _panel_label(self, text: str, top: int = 12) -> None:
+        ctk.CTkLabel(self.settings_panel, text=text, anchor="w", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", padx=16, pady=(top, 2))
+
+    def _panel_hint(self, text: str, color: str = MUTED):
+        widget = ctk.CTkLabel(self.settings_panel, text=text, anchor="w", justify="left",
+                              wraplength=318, text_color=color,
+                              font=ctk.CTkFont("Segoe UI", 11))
+        widget.pack(fill="x", padx=16, pady=(0, 6))
+        return widget
+
+    def _bind_apply_on_leave(self, widget) -> None:
+        if hasattr(widget, "_entry"):
+            widget._entry.bind("<FocusOut>", lambda _e: self._schedule_apply())
+            widget._entry.bind("<Return>", lambda _e: self._schedule_apply())
+        else:
+            widget.bind("<FocusOut>", lambda _e: self._schedule_apply())
+
+    def _build_settings_panel(self, panel) -> None:
+        ctk.CTkLabel(panel, text="Настройки", anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 16, "bold")).pack(fill="x", padx=16, pady=(16, 4))
+
+        self._panel_label("Модель")
+        self.var_model = tk.StringVar(value=self.config["model"])
+        model_box = ctk.CTkComboBox(panel, values=MODELS, variable=self.var_model,
+                                    state="readonly", corner_radius=10, fg_color=BG,
+                                    border_color=BORDER, button_color=BORDER,
+                                    button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
+                                    command=lambda _v: self._schedule_apply(),
+                                    font=ctk.CTkFont("Segoe UI", 12))
+        model_box.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._panel_label("Микрофон")
+        self.var_device = tk.StringVar(value=self._device_label())
+        device_box = ctk.CTkComboBox(panel, values=_input_devices(), variable=self.var_device,
+                                     state="readonly", corner_radius=10, fg_color=BG,
+                                     border_color=BORDER, button_color=BORDER,
+                                     button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
+                                     command=lambda _v: self._schedule_apply(),
+                                     font=ctk.CTkFont("Segoe UI", 12))
+        device_box.pack(fill="x", padx=16, pady=(0, 4))
+
+        self.var_hotkey = tk.StringVar(value=self.config["hotkey"])
+        self._hotkey_row("Хоткей диктовки", self.var_hotkey)
+        self.var_show = tk.StringVar(value=self.config["show_hotkey"])
+        self._hotkey_row("Хоткей окна", self.var_show)
+        self.hotkey_note = self._panel_hint(
+            "Ctrl/Shift/Alt + клавиша. Win и одиночные клавиши не поддерживаются.")
+
+        self._panel_label("Режим хоткея")
+        self.var_mode = tk.StringVar(value="удерживать" if self.config.get("hotkey_mode") == "hold"
+                                   else "переключатель")
+        ctk.CTkComboBox(panel, values=["переключатель", "удерживать"], variable=self.var_mode,
+                        state="readonly", corner_radius=10, fg_color=BG, border_color=BORDER,
+                        button_color=BORDER, button_hover_color=CARD_HOVER,
+                        dropdown_fg_color=BG, command=lambda _v: self._schedule_apply(),
+                        font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", padx=16, pady=(0, 4))
+
+        row = ctk.CTkFrame(panel, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(10, 4))
+        self.var_auto_stop = tk.BooleanVar(value=bool(self.config.get("auto_stop", True)))
+        ctk.CTkCheckBox(row, text="Стоп по паузе, мс", variable=self.var_auto_stop,
+                        font=ctk.CTkFont("Segoe UI", 12), checkbox_width=20, checkbox_height=20,
+                        corner_radius=6, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        command=self._on_auto_stop_toggle).pack(side="left")
+        self.var_silence = tk.IntVar(value=int(self.config["silence_ms"]))
+        self.entry_silence = ctk.CTkEntry(row, textvariable=self.var_silence, width=70,
+                                          corner_radius=10, fg_color=BG, border_color=BORDER)
+        self.entry_silence.pack(side="left", padx=(10, 0))
+        self._bind_apply_on_leave(self.entry_silence)
+
+        self._panel_label("Максимум записи, с", top=6)
+        self.var_max = tk.IntVar(value=int(self.config["max_seconds"]))
+        entry_max = ctk.CTkEntry(panel, textvariable=self.var_max, width=90, corner_radius=10,
+                                 fg_color=BG, border_color=BORDER)
+        entry_max.pack(anchor="w", padx=16, pady=(0, 4))
+        self._bind_apply_on_leave(entry_max)
+        self._panel_hint("Без автостопа пишем до «Стоп» или этого лимита.")
+
+        self.var_minimized = tk.BooleanVar(value=bool(self.config["start_minimized"]))
+        ctk.CTkCheckBox(panel, text="Запускать свёрнутым", variable=self.var_minimized,
+                        font=ctk.CTkFont("Segoe UI", 12), checkbox_width=20, checkbox_height=20,
+                        corner_radius=6, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        command=self._schedule_apply).pack(anchor="w", padx=16, pady=(8, 6))
+
+        self._panel_label("Замены: как слышится = Как надо", top=6)
+        self.txt_replacements = ctk.CTkTextbox(panel, height=110, corner_radius=10, fg_color=BG,
+                                               border_width=1, border_color=BORDER,
+                                               font=ctk.CTkFont("Segoe UI", 12))
+        self.txt_replacements.pack(fill="x", padx=16, pady=(0, 16))
+        self.txt_replacements.insert("1.0", _replacements_to_text(self.config.get("replacements") or {}))
+        self.txt_replacements.bind("<FocusOut>", lambda _e: self._schedule_apply())
+
+        ctk.CTkLabel(panel, text="Изменения применяются сразу", text_color=MUTED, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 11)).pack(fill="x", padx=16, pady=(0, 16))
+
+    def _device_label(self) -> str:
+        devices = _input_devices()
+        if self.config.get("device") is None:
+            return "По умолчанию"
+        for item in devices:
+            if item.startswith(f"{self.config['device']}:"):
+                return item
+        return "По умолчанию"
+
+    def _on_auto_stop_toggle(self) -> None:
+        self.entry_silence.configure(state="normal" if self.var_auto_stop.get() else "disabled")
+        self._schedule_apply()
+
+    def _hotkey_row(self, title: str, var: tk.StringVar) -> None:
+        self._panel_label(title)
+        holder = ctk.CTkFrame(self.settings_panel, fg_color="transparent")
+        holder.pack(fill="x", padx=16, pady=(0, 4))
+        entry = ctk.CTkEntry(holder, textvariable=var, corner_radius=10, fg_color=BG,
+                             border_color=BORDER, font=ctk.CTkFont("Segoe UI", 12))
+        entry.pack(side="left", fill="x", expand=True)
+        self._bind_apply_on_leave(entry)
+        mark = ctk.CTkLabel(holder, text="", width=16, font=ctk.CTkFont("Segoe UI", 12))
+        mark.pack(side="left", padx=(6, 0))
+        ctk.CTkButton(holder, text="Записать", width=88, height=28, corner_radius=9,
+                      fg_color=BG, hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
+                      text_color=TEXT, font=ctk.CTkFont("Segoe UI", 11),
+                      command=lambda: self._start_capture(var, mark)).pack(side="left", padx=(6, 0))
+
+    # ---------- запись комбинации в панели ----------
+    def _start_capture(self, var: tk.StringVar, mark) -> None:
+        self._capture = {"var": var, "mark": mark, "after": None}
+        mark.configure(text="…", text_color=MUTED)
+        if not hotkey_capture.HOOK_READY["ok"]:
+            self.hotkey_note.configure(text="Хук недоступен — запись комбинации не работает",
+                                       text_color="#e0554f")
+            return
+        hotkey_capture.start_capture()
+        self._capture_poll()
+        self.root.after(8000, self._capture_timeout)
+
+    def _capture_poll(self) -> None:
+        if self._capture is None:
+            return
+        combo = hotkey_capture.poll_capture()
+        if combo is None:
+            self._capture["after"] = self.root.after(60, self._capture_poll)
+            return
+        mark = self._capture["mark"]
+        if not combo:
+            mark.configure(text="")
+            self.hotkey_note.configure(text="Запись отменена", text_color=MUTED)
+            self._capture = None
+            return
+        error = _combo_error(combo)
+        if error:
+            mark.configure(text="×", text_color="#e0554f")
+            self.hotkey_note.configure(text=f"{error}. Старое значение оставлено.",
+                                       text_color="#e0554f")
+        else:
+            self._capture["var"].set(combo)
+            mark.configure(text="✓", text_color="#4caf68")
+            self.hotkey_note.configure(text=f"Записано: {combo}", text_color="#4caf68")
+            self._schedule_apply()
+        self._capture = None
+
+    def _capture_timeout(self) -> None:
+        if self._capture is None:
+            return
+        hotkey_capture.cancel_capture()
+        self._capture["mark"].configure(text="")
+        self._capture = None
+
+    # ---------- применение настроек ----------
+    def _schedule_apply(self) -> None:
+        if getattr(self, "_applying", False):
+            return
+        if getattr(self, "_apply_after", None) is not None:
+            self.root.after_cancel(self._apply_after)
+        self._apply_after = self.root.after(400, self._apply_settings)
+
+    def _apply_settings(self) -> None:
+        self._apply_after = None
+        dict_combo = self.var_hotkey.get().strip().lower()
+        show_combo = self.var_show.get().strip().lower()
+        for combo in (dict_combo, show_combo):
+            try:
+                parse_hotkey(combo)
+            except ValueError as exc:
+                self.status.set(f"Хоткей: {exc}")
+                self.hotkey_note.configure(text=f"Хоткей: {exc}", text_color="#e0554f")
+                return
+        try:
+            silence = max(200, int(self.var_silence.get()))
+            limit = max(10, int(self.var_max.get()))
+            device_text = self.var_device.get()
+            device = None if device_text == "По умолчанию" else int(device_text.split(":", 1)[0])
+        except (ValueError, tk.TclError):
+            self.status.set("Проверьте числа: пауза и максимум записи")
+            return
+        if self.var_auto_stop.get() and silence >= limit * 1000:
+            self.status.set("Пауза больше максимальной длительности")
+            return
+
+        values = {
+            "model": self.var_model.get(),
+            "device": device,
+            "hotkey": dict_combo,
+            "show_hotkey": show_combo,
+            "hotkey_mode": "hold" if self.var_mode.get() == "удерживать" else "toggle",
+            "silence_ms": silence,
+            "auto_stop": bool(self.var_auto_stop.get()),
+            "max_seconds": limit,
+            "autopaste": bool(self.autopaste.get()),
+            "start_minimized": bool(self.var_minimized.get()),
+            "replacements": _text_to_replacements(self.txt_replacements.get("1.0", "end-1c")),
+        }
+        if all(self.config.get(key) == value for key, value in values.items()):
+            return
+
+        old_model = self.config["model"]
+        old_hotkey = (self.config["hotkey"], self.config["show_hotkey"])
+        self._applying = True
+        try:
+            self.config.update(values)
+            self.config.save()
+            self.recorder.device = self.config.get("device")
+            if (self.config["hotkey"], self.config["show_hotkey"]) != old_hotkey:
+                set_hotkeys(self.config["hotkey"], self.config["show_hotkey"])
+                self._refresh_record_button()
+            if self.config["model"] != old_model:
+                self.engine = GigaAMEngine(model_name=self.config["model"], log=self.log,
+                                          on_progress=self._model_progress)
+                threading.Thread(target=self._warm_up, daemon=True).start()
+        finally:
+            self._applying = False
+        self.status.set("Настройки сохранены")
 
     # ---------- трей ----------
     def _setup_tray(self) -> bool:
@@ -521,8 +815,6 @@ class App:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Настройки…", command=self.open_settings_dialog)
-        file_menu.add_separator()
         file_menu.add_command(label="Свернуть", command=self.hide_to_tray)
         file_menu.add_command(label="Выход", command=self._quit)
         menubar.add_cascade(label="Файл", menu=file_menu)
@@ -532,28 +824,6 @@ class App:
         help_menu.add_command(label="О программе", command=self.show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
         self.root.config(menu=menubar)
-
-    def open_settings_dialog(self) -> None:
-        values = open_settings(self.root, self.config)
-        if not values:
-            return
-        old_model = self.config["model"]
-        self.config.update(values)
-        self.config.save()
-
-        self.autopaste.set(bool(self.config["autopaste"]))
-        self.recorder.device = self.config.get("device")
-        try:
-            set_hotkeys(self.config["hotkey"], self.config["show_hotkey"])
-        except ValueError as exc:
-            messagebox.showerror("Настройки", f"Хоткей: {exc}", parent=self.root)
-        self._refresh_record_button()
-
-        if self.config["model"] != old_model:
-            self.engine = GigaAMEngine(model_name=self.config["model"], log=self.log,
-                                      on_progress=self._model_progress)
-            threading.Thread(target=self._warm_up, daemon=True).start()
-        self.status.set("Настройки сохранены")
 
     def run_diagnostics(self) -> None:
         log_tail = ""
