@@ -101,7 +101,8 @@ def _download(url: str, dest: Path, size: int, workers: int, progress, log) -> N
 
     queue_lock = threading.Lock()
     state_lock = threading.Lock()
-    counter = {"bytes": sum(end - start + 1 for index, start, end in ranges if index in done)}
+    counter = {"bytes": sum(ranges[index][1] - ranges[index][0] + 1 for index in done
+                            if index < len(ranges))}
 
     def worker() -> None:
         while True:

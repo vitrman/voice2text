@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import time
+import traceback
 import uuid
 import wave
 from pathlib import Path
@@ -282,8 +283,8 @@ class GigaAMEngine:
             from model_fetch import ensure_model
             target = self._name or CANDIDATES[0]
             model_dir = ensure_model(target, MODEL_DIR, progress=self._on_progress, log=self._log)
-        except Exception as exc:
-            self._log(f"подготовка модели не удалась: {exc}")
+        except Exception:
+            self._log(f"подготовка модели не удалась:\n{traceback.format_exc()}")
 
         errors = []
         for name in ([self._name] if self._name else CANDIDATES):

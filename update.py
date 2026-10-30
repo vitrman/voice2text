@@ -34,12 +34,23 @@ def version_tuple(text: str) -> tuple[int, ...]:
     return tuple(numbers)
 
 
+class NoReleases(RuntimeError):
+    """На GitHub ещё нет ни одного опубликованного релиза (404)."""
+
+
 def _request(url: str):
     request = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/vnd.github+json",
     })
-    return urllib.request.urlopen(request, timeout=TIMEOUT)
+    try:
+        return urllib.request.urlopen(request, timeout=TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise NoReleases("на GitHub ещё нет опубликованных релизов") from exc
+        if exc.code == 403:
+            raise RuntimeError("GitHub ограничил частоту запросов, попробуйте позже") from exc
+        raise
 
 
 def fetch_latest(repo: str) -> dict:

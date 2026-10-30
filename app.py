@@ -411,9 +411,24 @@ class App:
         start_keyboard_hook()
         self._setup_tray()
         if self.config.get("check_updates", True):
-            self.root.after(15000, lambda: self.check_updates(silent=True))
+            self.root.after(15000, self._auto_update_check)
 
     # ---------- обновления ----------
+    def _auto_update_check(self) -> None:
+        """Автопроверка не чаще раза в 12 часов: лишние запросы к GitHub не нужны."""
+        try:
+            last = float(self.config.get("last_update_check") or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if time.time() - last < 12 * 3600:
+            return
+        self.config["last_update_check"] = int(time.time())
+        try:
+            self.config.save()
+        except OSError:
+            pass
+        self.check_updates(silent=True)
+
     def check_updates(self, silent: bool = False) -> None:
         if update.current_target() is None and not silent:
             self.status.set("Обновление доступно только для установленной версии")
@@ -423,6 +438,11 @@ class App:
         def worker() -> None:
             try:
                 info = update.check(repo, VERSION)
+            except update.NoReleases as exc:
+                trace(f"обновления: {exc}")
+                if not silent:
+                    self.events.put(("status", f"Обновлений нет: {exc}"))
+                return
             except Exception as exc:
                 trace_exc("проверка обновлений")
                 if not silent:
