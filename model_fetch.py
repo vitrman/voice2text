@@ -25,6 +25,10 @@ HASHES = {
 CHUNK = 4 * 1024 * 1024
 
 
+class DownloadCancelled(RuntimeError):
+    """Пользователь отменил скачивание модели (недокачанные куски остаются)."""
+
+
 def md5(path: Path) -> str:
     digest = hashlib.md5()
     with open(path, "rb") as fh:
@@ -85,7 +89,8 @@ def _save_state(state_path: Path, done: set[int]) -> None:
         pass
 
 
-def _download(url: str, dest: Path, size: int, workers: int, progress, log) -> None:
+def _download(url: str, dest: Path, size: int, workers: int, progress, log,
+              cancel=None) -> None:
     state_path = dest.with_suffix(".json")
     done = _load_state(state_path)
     if not dest.exists() or dest.stat().st_size != size:
@@ -106,6 +111,8 @@ def _download(url: str, dest: Path, size: int, workers: int, progress, log) -> N
 
     def worker() -> None:
         while True:
+            if cancel is not None and cancel.is_set():
+                return
             with queue_lock:
                 if not queue:
                     return
@@ -135,6 +142,10 @@ def _download(url: str, dest: Path, size: int, workers: int, progress, log) -> N
     for thread in threads:
         thread.join()
 
+    if cancel is not None and cancel.is_set():
+        # куски и state.json остаются на диске: продолжение не начнётся с нуля
+        raise DownloadCancelled("скачивание модели отменено")
+
 
 def _ensure_tokenizer(name: str, directory: Path, log) -> None:
     if "e2e" not in name:
@@ -154,7 +165,8 @@ def _ensure_tokenizer(name: str, directory: Path, log) -> None:
     urllib.request.urlretrieve(f"{BASE}/{name}_tokenizer.model", tokenizer)
 
 
-def ensure_model(name: str, directory: Path, workers: int = 8, progress=None, log=print) -> Path:
+def ensure_model(name: str, directory: Path, workers: int = 8, progress=None, log=print,
+                 cancel=None) -> Path:
     """Возвращает каталог с валидным чекпойнтом, скачивая только если нигде нет."""
     found = find_model(name, directory)
     if found is not None:
@@ -174,7 +186,7 @@ def ensure_model(name: str, directory: Path, workers: int = 8, progress=None, lo
     log(f"скачиваю модель {name}: {size / 1e6:.0f} МБ")
 
     part = ckpt.with_suffix(".part")
-    _download(url, part, size, workers, progress, log)
+    _download(url, part, size, workers, progress, log, cancel=cancel)
     if not is_valid(part, name):
         part.unlink(missing_ok=True)
         part.with_suffix(".json").unlink(missing_ok=True)

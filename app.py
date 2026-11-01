@@ -17,6 +17,7 @@ from tkinter import messagebox, ttk
 
 import customtkinter as ctk
 
+import autostart
 from asr_engine import GigaAMEngine
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
@@ -26,6 +27,8 @@ from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
 from jobs import TranscriptionQueue
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
+from theme import (ACCENT, ACCENT_HOVER, BG, BORDER, CARD, CARD_HOVER, MUTED,
+                   RECORD, RECORD_HOVER, TEXT)
 import update
 from version import VERSION
 import win32
@@ -39,17 +42,6 @@ from paths import DATA, ROOT
 
 DEFAULT_REPO = "vitrman/voice2text"
 
-# палитра тёмной темы
-BG = "#121316"
-CARD = "#1b1d21"
-CARD_HOVER = "#23262b"
-BORDER = "#2e3238"
-ACCENT = "#4f8cff"
-ACCENT_HOVER = "#3d78e6"
-RECORD = "#e0554f"
-RECORD_HOVER = "#c84640"
-TEXT = "#f2f3f5"
-MUTED = "#8b9199"
 
 def _input_devices() -> list[str]:
     try:
@@ -347,6 +339,7 @@ class App:
         self._update_info = None
         self._update_dialog = None
         self._pending_model = None    # смена модели ждёт окончания распознавания
+        self._wizard = None
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self._log_environment()
@@ -367,6 +360,8 @@ class App:
         start_keyboard_hook()
         self._setup_tray()
         self._warn_missing_device()
+        if not self.config.get("first_run_done"):
+            self.root.after(700, self._maybe_first_run)
         if self.config.get("check_updates", True):
             self.root.after(15000, self._auto_update_check)
 
@@ -630,6 +625,10 @@ class App:
         # список устройств обновляем при открытии: воткнутая гарнитура появляется сразу
         device_box.bind("<Button-1>", lambda _e: self._refresh_devices(), add="+")
         self.device_box = device_box
+        ctk.CTkButton(panel, text="Проверить микрофон", height=30, corner_radius=9,
+                      fg_color=CARD_HOVER, hover_color=BORDER, text_color=TEXT,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self._test_microphone).pack(fill="x", padx=16, pady=(0, 4))
 
         self._hotkey_entries: dict[str, object] = {}
         self.var_hotkey = tk.StringVar(value=self.config["hotkey"])
@@ -667,7 +666,18 @@ class App:
         ctk.CTkCheckBox(panel, text="Запускать свёрнутым", variable=self.var_minimized,
                         font=ctk.CTkFont("Segoe UI", 12), checkbox_width=20, checkbox_height=20,
                         corner_radius=6, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                        command=self._schedule_apply).pack(anchor="w", padx=16, pady=(8, 6))
+                        command=self._schedule_apply).pack(anchor="w", padx=16, pady=(8, 4))
+
+        self.var_autostart = tk.BooleanVar(value=autostart.enabled())
+        self.autostart_box = ctk.CTkCheckBox(
+            panel, text="Запускать при входе в Windows", variable=self.var_autostart,
+            font=ctk.CTkFont("Segoe UI", 12), checkbox_width=20, checkbox_height=20,
+            corner_radius=6, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._on_autostart_toggle)
+        self.autostart_box.pack(anchor="w", padx=16, pady=(0, 6))
+        if not autostart.available():
+            self.autostart_box.configure(state="disabled")
+            self._panel_hint("Автозапуск доступен в установленной версии, не из исходников.")
 
         self._panel_label("Замены: как слышится = Как надо", top=6)
         self.txt_replacements = ctk.CTkTextbox(panel, height=110, corner_radius=10, fg_color=BG,
@@ -679,6 +689,41 @@ class App:
 
         ctk.CTkLabel(panel, text="Изменения применяются сразу", text_color=MUTED, anchor="w",
                      font=ctk.CTkFont("Segoe UI", 11)).pack(fill="x", padx=16, pady=(0, 16))
+
+    def _on_autostart_toggle(self) -> None:
+        try:
+            autostart.set_enabled(bool(self.var_autostart.get()))
+        except OSError as exc:
+            self.status.set(f"Автозапуск не настроен: {exc}")
+            self.var_autostart.set(autostart.enabled())
+            return
+        self.status.set("Автозапуск включён" if self.var_autostart.get()
+                        else "Автозапуск выключен")
+
+    def _test_microphone(self) -> None:
+        from mic_check import open_mic_test
+
+        open_mic_test(self.root, self.config.get("device"), log=lambda message: trace(f"mic: {message}"))
+
+    # ---------- первый запуск ----------
+    def _maybe_first_run(self) -> None:
+        """Визард только при первом ручном запуске: при автозапуске окно не показываем."""
+        if self.config.get("first_run_done") or self.start_hidden or self.quitting:
+            return
+        from first_run import FirstRunWizard
+
+        trace("первый запуск: показываю визард")
+        self._wizard = FirstRunWizard(self.root, self.config, self.engine,
+                                      self._first_run_done, log=trace,
+                                      hotkey=HOTKEYS.shown("dictate"))
+
+    def _first_run_done(self) -> None:
+        self.config["first_run_done"] = True
+        try:
+            self.config.save()
+        except OSError:
+            pass
+        self.status.set("Готово. Нажмите хоткей и говорите.")
 
     def _device_label(self) -> str:
         spec = self.config.get("device")
@@ -1342,6 +1387,8 @@ class App:
             trace(f"запись не удалась: {exc}")
             self.events.put(("status", str(exc)))
             self.events.put(("overlay", (str(exc)[:60], "#e05555", 2500)))
+            if "икрофон" in str(exc) or "ечь" in str(exc):
+                self.events.put(("mic_problem", str(exc)))
         except Exception as exc:
             trace_exc("recording error")
             self.events.put(("status", f"Ошибка записи: {exc}"))
@@ -1438,6 +1485,11 @@ class App:
                     self._on_queue_state(payload)
                 elif kind == "take_error":
                     self._on_take_error(*payload)
+                elif kind == "mic_problem":
+                    if messagebox.askyesno("Голосовой ввод",
+                                           f"{payload}\n\nОткрыть проверку микрофона?",
+                                           parent=self.root):
+                        self._test_microphone()
                 elif kind == "level":
                     percent = max(0.0, min(100.0, payload))
                     self.level.set(percent / 100.0)
@@ -1665,10 +1717,16 @@ def _main() -> None:
         root.destroy()
         return
     config = Config.load(on_error=trace)
+    try:
+        if autostart.sync():
+            trace("автозапуск: путь обновлён")
+    except Exception:
+        trace_exc("автозапуск")
     app = App(root, config)
     win32.start_show_listener(lambda: app.events.put(("show", None)))
     # окно сворачивается только когда иконка трея реально создалась (см. tray_ready)
-    app.start_hidden = bool(config["start_minimized"]) and "--show" not in sys.argv
+    hidden = config["start_minimized"] or "--minimized" in sys.argv
+    app.start_hidden = hidden and "--show" not in sys.argv
     root.mainloop()
 
 
