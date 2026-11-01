@@ -18,9 +18,9 @@ import customtkinter as ctk
 
 from asr_engine import GigaAMEngine
 from clipboard import set_text as set_clipboard_text
-from config import Config
+from config import MODELS, MODEL_LABELS, Config
 import hotkey_capture
-from hotkeys import MOD_NOREPEAT, parse_hotkey
+from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
 import update
@@ -42,15 +42,30 @@ RECORD_HOVER = "#c84640"
 TEXT = "#f2f3f5"
 MUTED = "#8b9199"
 
-MODELS = ["v3_e2e_rnnt", "v3_e2e_ctc", "v3_rnnt", "v3_ctc"]
-
-
 def _input_devices() -> list[str]:
     try:
         from recorder import list_input_devices
         return ["По умолчанию"] + list_input_devices()
     except Exception:
         return ["По умолчанию"]
+
+
+def _device_from_label(label: str):
+    """«3: Микрофон (USB)» -> {'name':…, 'hostapi':…}: имя переживает переподключение."""
+    if not label or label == "По умолчанию":
+        return None
+    try:
+        from recorder import input_device_items
+        for item in input_device_items():
+            if item["label"] == label:
+                return {"name": item["name"], "hostapi": item["hostapi"]}
+    except Exception:
+        pass
+    return None
+
+
+def _model_label(name: str) -> str:
+    return MODEL_LABELS.get(name, name)
 
 
 def _replacements_to_text(replacements: dict) -> str:
@@ -145,7 +160,6 @@ USER32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, 
 USER32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 VK_CONTROL, VK_V = 0x11, 0x56
-VK_MENU, VK_SPACE = 0x12, 0x20
 KEYEVENTF_KEYUP = 0x0002
 
 
@@ -178,8 +192,6 @@ USER32.SendInput.restype = ctypes.c_uint
 USER32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
 
 WM_HOTKEY = 0x0312
-MOD_ALT, MOD_CONTROL, MOD_NOREPEAT = 0x0001, 0x0002, 0x4000
-VK_SPACE = 0x20
 GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
@@ -198,13 +210,11 @@ class MSG(ctypes.Structure):
 
 HOTKEY_TID = {"tid": 0}
 WM_RELOAD_HOTKEYS = 0x8000 + 1
+WM_RETRY_HOTKEYS = 0x8000 + 2
+HOTKEY_RETRY_SECONDS = 60.0
+_RETRY_STARTED = {"done": False}
 
 WH_KEYBOARD_LL = 13
-WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
-WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
-VK_LWIN, VK_RWIN = 0x5B, 0x5C
-HOOK_EVENT = {"event": None}
-HOOK_OK = {"ok": False}
 
 
 USER32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
@@ -223,17 +233,15 @@ HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, c
 
 
 def _hook_proc(n_code, w_param, l_param):
-    """Запись комбинации и отпускание клавиш для режима рации."""
-    if n_code == 0:
+    """Только запись комбинации: остановку режима «удерживать» делает опрос клавиш.
+
+    Хук не видит нажатий, когда активное окно запущено от администратора (UIPI),
+    поэтому полагаться на него в остановке записи нельзя.
+    """
+    if n_code == 0 and hotkey_capture.is_active():
         vk = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
-        if hotkey_capture.is_active():
-            hotkey_capture.feed_key(vk, w_param)
-            return 1  # пока пишем комбинацию, клавиши не уходят в окна
-        if w_param in (WM_KEYUP, WM_SYSKEYUP):
-            if vk in (VK_CONTROL, VK_MENU, VK_SPACE):
-                event = HOOK_EVENT["event"]
-                if event is not None and not event.is_set():
-                    event.set()
+        hotkey_capture.feed_key(vk, w_param)
+        return 1  # пока пишем комбинацию, клавиши не уходят в окна
     return USER32.CallNextHookEx(None, n_code, w_param, l_param)
 
 
@@ -245,7 +253,6 @@ def start_keyboard_hook() -> None:
         if not handle:
             trace(f"hook: не установлен, ошибка {ctypes.windll.kernel32.GetLastError()}")
             return
-        HOOK_OK["ok"] = True
         hotkey_capture.HOOK_READY["ok"] = True
         trace("hook: клавиатурный хук установлен")
         msg = MSG()
@@ -254,26 +261,10 @@ def start_keyboard_hook() -> None:
 
     threading.Thread(target=run, daemon=True).start()
 
-# строки комбинаций и их коды: меняются из настроек, читаются потоком хоткеев
-HOTKEY_COMBOS = {"dictate": "ctrl+shift+space", "show": "ctrl+shift+w"}
-HOTKEY_SPECS = {name: parse_hotkey(combo) for name, combo in HOTKEY_COMBOS.items()}
-HOTKEY_ACTUAL = dict(HOTKEY_COMBOS)
-HOTKEY_FALLBACKS = {
-    "dictate": ["ctrl+shift+space", "ctrl+shift+f9", "ctrl+alt+d"],
-    "show": ["ctrl+shift+w", "ctrl+shift+f10", "ctrl+alt+o"],
-}
 
-
-def apply_hotkey_specs(dictate: str, show: str) -> None:
-    """Разбирает комбинации в коды WinAPI (ошибка разбора — умолчание)."""
-    for name, combo in (("dictate", dictate), ("show", show)):
-        try:
-            mods, vk = parse_hotkey(combo)
-        except ValueError:
-            combo = HOTKEY_FALLBACKS[name][0]
-            mods, vk = parse_hotkey(combo)
-        HOTKEY_COMBOS[name] = combo
-        HOTKEY_SPECS[name] = (mods, vk)
+def apply_hotkey_specs(dictate: str, show: str) -> bool:
+    """Разбирает комбинации в коды WinAPI (ошибка — запасная). False — была подмена."""
+    return HOTKEYS.configure(dictate, show)
 
 
 def set_hotkeys(dictate: str, show: str) -> None:
@@ -288,29 +279,58 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
 
     def register() -> None:
         for hotkey_id, name in ((1, "dictate"), (2, "show")):
-            candidates = [HOTKEY_COMBOS[name]] + [c for c in HOTKEY_FALLBACKS[name]
-                                                  if c != HOTKEY_COMBOS[name]]
             registered = None
-            for combo in candidates:
+            for combo in HOTKEYS.candidates(name):
                 mods, vk = parse_hotkey(combo)
                 if USER32.RegisterHotKey(None, hotkey_id, mods, vk):
                     registered = combo
                     break
                 trace(f"hotkey: {combo} занят, ошибка {ctypes.windll.kernel32.GetLastError()}")
             if registered:
-                HOTKEY_ACTUAL[name] = registered
+                HOTKEYS.set_actual(name, registered)
                 trace(f"hotkey: {name} = {registered}")
             else:
+                HOTKEYS.set_actual(name, "")
                 trace(f"hotkey: {name} не удалось назначить ни одну комбинацию")
                 if on_status:
                     on_status(name, None)
                 continue
-            if registered != HOTKEY_COMBOS[name] and on_status:
+            if registered != HOTKEYS.requested(name) and on_status:
                 on_status(name, registered)
+
+    def retry_requested() -> None:
+        """Пробует вернуть желаемую комбинацию: помешавшая программа могла закрыться."""
+        for hotkey_id, name in ((1, "dictate"), (2, "show")):
+            requested = HOTKEYS.requested(name)
+            previous = HOTKEYS.actual(name)
+            if previous == requested or not probe_hotkey(requested):
+                continue
+            mods, vk = parse_hotkey(requested)
+            USER32.UnregisterHotKey(None, hotkey_id)
+            if USER32.RegisterHotKey(None, hotkey_id, mods, vk):
+                HOTKEYS.set_actual(name, requested)
+                trace(f"hotkey: вернул {name} = {requested}")
+                if on_status:
+                    on_status(name, requested)
+            elif previous:
+                # не получилось — возвращаем то, что работало, чтобы не остаться без хоткея
+                mods, vk = parse_hotkey(previous)
+                if USER32.RegisterHotKey(None, hotkey_id, mods, vk):
+                    HOTKEYS.set_actual(name, previous)
+
+    def heartbeat() -> None:
+        while True:
+            time.sleep(HOTKEY_RETRY_SECONDS)
+            tid = HOTKEY_TID.get("tid")
+            if tid:
+                USER32.PostThreadMessageW(tid, WM_RETRY_HOTKEYS, 0, 0)
 
     def run() -> None:
         HOTKEY_TID["tid"] = ctypes.windll.kernel32.GetCurrentThreadId()
         register()
+        if not _RETRY_STARTED["done"]:
+            _RETRY_STARTED["done"] = True
+            threading.Thread(target=heartbeat, daemon=True).start()
         msg = MSG()
         while USER32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY:
@@ -324,6 +344,8 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
                 USER32.UnregisterHotKey(None, 1)
                 USER32.UnregisterHotKey(None, 2)
                 register()
+            elif msg.message == WM_RETRY_HOTKEYS:
+                retry_requested()
         USER32.UnregisterHotKey(None, 1)
         USER32.UnregisterHotKey(None, 2)
 
@@ -445,9 +467,11 @@ class App:
         self._update_cancel = None
         self._update_info = None
         self._update_dialog = None
+        self._pending_model = None    # смена модели ждёт окончания распознавания
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self._log_environment()
+        threading.Thread(target=self._cleanup_cache, daemon=True).start()
         self.root.report_callback_exception = self._ui_exception
         self._build_ui()
         self.root.after(80, self._drain_events)
@@ -463,10 +487,34 @@ class App:
                               lambda name, combo: self.events.put(("hotkey_changed", (name, combo))))
         start_keyboard_hook()
         self._setup_tray()
+        self._warn_missing_device()
         if self.config.get("check_updates", True):
             self.root.after(15000, self._auto_update_check)
 
+    def _warn_missing_device(self) -> None:
+        """Микрофон мог исчезнуть: молча писать тишину хуже, чем сказать об этом."""
+        spec = self.config.get("device")
+        if spec is None:
+            return
+        try:
+            from recorder import device_index
+            _index, found = device_index(spec, log=lambda message: trace(f"device: {message}"))
+        except Exception:
+            return
+        if not found:
+            self.status.set("Выбранный микрофон не найден — пишу с устройства по умолчанию")
+
     # ---------- обновления ----------
+    def _cleanup_cache(self) -> None:
+        """Убирает архивы и распаковки обновлений, которые уже отработали."""
+        try:
+            freed = update.cleanup_cache(VERSION)
+            freed += update.cleanup_install_leftovers(update.current_target())
+            if freed:
+                trace(f"кэш обновлений: освобождено {freed / 2 ** 20:.0f} МБ")
+        except Exception:
+            trace_exc("уборка кэша обновлений")
+
     def _auto_update_check(self) -> None:
         """Автопроверка не чаще раза в 12 часов: лишние запросы к GitHub не нужны."""
         try:
@@ -549,7 +597,8 @@ class App:
         try:
             archive = update.download(info["url"], info["name"], progress,
                                       cancel=self._update_cancel,
-                                      expected_size=info.get("size") or 0)
+                                      expected_size=info.get("size") or 0,
+                                      expected_sha=info.get("sha256") or "")
         except update.UpdateCancelled:
             self.events.put(("update_cancelled", None))
             return
@@ -561,16 +610,17 @@ class App:
 
     def _install_update(self, archive) -> None:
         try:
-            helper = update.apply(archive, update.current_target(), pid=os.getpid())
+            update.verify_archive(archive, (self._update_info or {}).get("sha256") or "")
+            setup = update.apply(archive, update.current_target(), pid=os.getpid())
         except Exception as exc:
             trace_exc("установка обновления")
             self._update_busy = False
             self._close_update_dialog()
             self.status.set(f"Обновление не установлено: {exc}")
             messagebox.showerror("Обновление",
-                                 f"Не удалось запустить установку:\n{exc}", parent=self.root)
+                                 f"Не удалось установить обновление:\n{exc}", parent=self.root)
             return
-        trace(f"обновление запущено через {helper}, закрываю приложение")
+        trace(f"обновление запущено: {setup}, закрываю приложение")
         self._close_update_dialog()
         self.status.set("Установка обновления — приложение перезапустится")
         self.root.after(600, self._quit)
@@ -678,8 +728,10 @@ class App:
                      font=ctk.CTkFont("Segoe UI", 16, "bold")).pack(fill="x", padx=16, pady=(16, 4))
 
         self._panel_label("Модель")
-        self.var_model = tk.StringVar(value=self.config["model"])
-        model_box = ctk.CTkComboBox(panel, values=MODELS, variable=self.var_model,
+        self.var_model = tk.StringVar(value=_model_label(self.config["model"]))
+        self._model_by_label = {_model_label(name): name for name in MODELS}
+        model_box = ctk.CTkComboBox(panel, values=[_model_label(name) for name in MODELS],
+                                    variable=self.var_model,
                                     state="readonly", corner_radius=10, fg_color=BG,
                                     border_color=BORDER, button_color=BORDER,
                                     button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
@@ -696,11 +748,15 @@ class App:
                                      command=lambda _v: self._schedule_apply(),
                                      font=ctk.CTkFont("Segoe UI", 12))
         device_box.pack(fill="x", padx=16, pady=(0, 4))
+        # список устройств обновляем при открытии: воткнутая гарнитура появляется сразу
+        device_box.bind("<Button-1>", lambda _e: self._refresh_devices(), add="+")
+        self.device_box = device_box
 
+        self._hotkey_entries: dict[str, object] = {}
         self.var_hotkey = tk.StringVar(value=self.config["hotkey"])
-        self._hotkey_row("Хоткей диктовки", self.var_hotkey)
+        self._hotkey_row("Хоткей диктовки", self.var_hotkey, "dictate")
         self.var_show = tk.StringVar(value=self.config["show_hotkey"])
-        self._hotkey_row("Хоткей окна", self.var_show)
+        self._hotkey_row("Хоткей окна", self.var_show, "show")
         self.hotkey_note = self._panel_hint(
             "Ctrl/Shift/Alt + клавиша. Win и одиночные клавиши не поддерживаются.")
 
@@ -752,25 +808,43 @@ class App:
                      font=ctk.CTkFont("Segoe UI", 11)).pack(fill="x", padx=16, pady=(0, 16))
 
     def _device_label(self) -> str:
-        devices = _input_devices()
-        if self.config.get("device") is None:
+        spec = self.config.get("device")
+        if spec is None:
             return "По умолчанию"
-        for item in devices:
-            if item.startswith(f"{self.config['device']}:"):
-                return item
+        if isinstance(spec, int):          # старый конфиг: номер устройства
+            for label in _input_devices():
+                if label.startswith(f"{spec}:"):
+                    return label
+            return "По умолчанию"
+        name = str((spec or {}).get("name") or "")
+        try:
+            from recorder import input_device_items
+            for item in input_device_items():
+                if item["name"] == name:
+                    return item["label"]
+        except Exception:
+            pass
         return "По умолчанию"
+
+    def _refresh_devices(self) -> None:
+        """Воткнутая гарнитура должна появляться без перезапуска приложения."""
+        labels = _input_devices()
+        self.device_box.configure(values=labels)
+        if self.var_device.get() not in labels:
+            self.var_device.set(self._device_label())
 
     def _on_auto_stop_toggle(self) -> None:
         self.entry_silence.configure(state="normal" if self.var_auto_stop.get() else "disabled")
         self._schedule_apply()
 
-    def _hotkey_row(self, title: str, var: tk.StringVar) -> None:
+    def _hotkey_row(self, title: str, var: tk.StringVar, name: str) -> None:
         self._panel_label(title)
         holder = ctk.CTkFrame(self.settings_panel, fg_color="transparent")
         holder.pack(fill="x", padx=16, pady=(0, 4))
         entry = ctk.CTkEntry(holder, textvariable=var, corner_radius=10, fg_color=BG,
                              border_color=BORDER, font=ctk.CTkFont("Segoe UI", 12))
         entry.pack(side="left", fill="x", expand=True)
+        self._hotkey_entries[name] = entry
         self._bind_apply_on_leave(entry)
         mark = ctk.CTkLabel(holder, text="", width=16, font=ctk.CTkFont("Segoe UI", 12))
         mark.pack(side="left", padx=(6, 0))
@@ -778,6 +852,35 @@ class App:
                       fg_color=BG, hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
                       text_color=TEXT, font=ctk.CTkFont("Segoe UI", 11),
                       command=lambda: self._start_capture(var, mark)).pack(side="left", padx=(6, 0))
+
+    def _on_hotkey_changed(self, name: str, combo: str | None) -> None:
+        """Говорит правду о хоткее: занятую комбинацию больше не прячем в строке статуса.
+
+        В поле остаётся желаемая комбинация (намерение пользователя), а подсказка
+        и рамка показывают, что реально работает сейчас.
+        """
+        requested = HOTKEYS.requested(name)
+        entry = self._hotkey_entries.get(name)
+        if combo is None:
+            if entry is not None:
+                entry.configure(border_color="#e0554f")
+            self.hotkey_note.configure(text=f"Не удалось назначить {requested}",
+                                       text_color="#e0554f")
+            self.status.set(f"Хоткей {requested} не назначен")
+        elif combo != requested:
+            if entry is not None:
+                entry.configure(border_color="#e0a33a")
+            self.hotkey_note.configure(
+                text=f"{requested} занята другой программой — сейчас работает {combo}. "
+                     f"Попробую вернуть автоматически.",
+                text_color="#e0a33a")
+            self.status.set(f"{requested} занята — работает {combo}")
+        else:
+            if entry is not None:
+                entry.configure(border_color=BORDER)
+            self.hotkey_note.configure(text=f"Хоткей {combo} работает", text_color="#4caf68")
+            self.status.set(f"Хоткей {combo} снова работает")
+        self._refresh_record_button()
 
     # ---------- запись комбинации в панели ----------
     def _start_capture(self, var: tk.StringVar, mark) -> None:
@@ -805,6 +908,9 @@ class App:
             self._capture = None
             return
         error = _combo_error(combo)
+        if not error and not self._combo_free(combo):
+            # проверяем сразу: иначе занятая комбинация всплывёт только после перезапуска
+            error = "эта комбинация занята другой программой"
         if error:
             mark.configure(text="×", text_color="#e0554f")
             self.hotkey_note.configure(text=f"{error}. Старое значение оставлено.",
@@ -822,6 +928,15 @@ class App:
         hotkey_capture.cancel_capture()
         self._capture["mark"].configure(text="")
         self._capture = None
+
+    @staticmethod
+    def _combo_free(combo: str) -> bool:
+        """Свободна ли комбинация: свои собственные считаем свободными."""
+        ours = {HOTKEYS.shown("dictate"), HOTKEYS.shown("show"),
+                HOTKEYS.requested("dictate"), HOTKEYS.requested("show")}
+        if combo in ours:
+            return True
+        return probe_hotkey(combo)
 
     # ---------- применение настроек ----------
     def _schedule_apply(self) -> None:
@@ -846,7 +961,7 @@ class App:
             silence = max(200, int(self.var_silence.get()))
             limit = max(10, int(self.var_max.get()))
             device_text = self.var_device.get()
-            device = None if device_text == "По умолчанию" else int(device_text.split(":", 1)[0])
+            device = _device_from_label(device_text)
         except (ValueError, tk.TclError):
             self.status.set("Проверьте числа: пауза и максимум записи")
             return
@@ -855,7 +970,7 @@ class App:
             return
 
         values = {
-            "model": self.var_model.get(),
+            "model": self._model_by_label.get(self.var_model.get(), self.config["model"]),
             "device": device,
             "hotkey": dict_combo,
             "show_hotkey": show_combo,
@@ -881,12 +996,29 @@ class App:
                 set_hotkeys(self.config["hotkey"], self.config["show_hotkey"])
                 self._refresh_record_button()
             if self.config["model"] != old_model:
-                self.engine = GigaAMEngine(model_name=self.config["model"], log=self.log,
-                                          on_progress=self._model_progress)
-                threading.Thread(target=self._warm_up, daemon=True).start()
+                # смена модели только в простое: иначе в памяти живут два чекпойнта
+                if self.busy:
+                    self._pending_model = self.config["model"]
+                    self.status.set("Модель будет сменена после распознавания")
+                else:
+                    self._switch_model(self.config["model"])
         finally:
             self._applying = False
-        self.status.set("Настройки сохранены")
+        if not self._pending_model:
+            self.status.set("Настройки сохранены")
+
+    def _switch_model(self, name: str) -> None:
+        old = self.engine
+        self.engine = GigaAMEngine(model_name=name, log=self.log, on_progress=self._model_progress)
+        old.dispose()
+        threading.Thread(target=self._warm_up, daemon=True).start()
+
+    def _apply_pending_model(self) -> None:
+        if not self._pending_model:
+            return
+        name, self._pending_model = self._pending_model, None
+        trace(f"смена модели на {name} после распознавания")
+        self._switch_model(name)
 
     # ---------- трей ----------
     def _setup_tray(self) -> bool:
@@ -912,7 +1044,7 @@ class App:
             pystray.MenuItem("Выход", lambda: self.events.put(("quit", None))),
         )
         self.icon = pystray.Icon("voice2text", image,
-                                 f"Голосовой ввод — {HOTKEY_ACTUAL['dictate']}", menu)
+                                 f"Голосовой ввод — {HOTKEYS.shown('dictate')}", menu)
         threading.Thread(target=self.icon.run, kwargs={"setup": self._on_tray_ready},
                          daemon=True).start()
         return True
@@ -975,7 +1107,7 @@ class App:
         # у Windows 11 часто уезжает в переполнение «^», и окно было бы не вернуть
         self.root.iconify()
         trace("окно свёрнуто на панель задач")
-        self.events.put(("overlay", (f"Свёрнуто · {HOTKEY_ACTUAL['show']} — открыть",
+        self.events.put(("overlay", (f"Свёрнуто · {HOTKEYS.shown('show')} — открыть",
                                      "#4caf50", 4000)))
 
     def _show_window(self) -> None:
@@ -1077,8 +1209,8 @@ class App:
             f"Голосовой ввод {VERSION}\n"
             f"GigaAM (Сбер), офлайн, русский язык\n"
             f"Модель: {self.engine.name}\n\n"
-            f"Диктовка: {HOTKEY_ACTUAL['dictate']}\n"
-            f"Показать окно: {HOTKEY_ACTUAL['show']}",
+            f"Диктовка: {HOTKEYS.shown('dictate')}\n"
+            f"Показать окно: {HOTKEYS.shown('show')}",
             parent=self.root)
 
     def _remember_own_hwnd(self) -> None:
@@ -1127,10 +1259,10 @@ class App:
 
     def _record_button_text(self) -> str:
         """Надпись кнопки показывает фактический хоткей, а не зашитый в код."""
-        return f"● Записать ({HOTKEY_ACTUAL['dictate']})"
+        return f"● Записать ({HOTKEYS.shown('dictate')})"
 
     def _stop_button_text(self) -> str:
-        return f"■ Стоп ({HOTKEY_ACTUAL['dictate']})"
+        return f"■ Стоп ({HOTKEYS.shown('dictate')})"
 
     def _refresh_record_button(self) -> None:
         self._set_record_state(self.recording)
@@ -1204,9 +1336,9 @@ class App:
 
     def start_push_to_talk(self) -> None:
         """Хоткей: пишем, пока клавиши зажаты; повторное нажатие — стоп."""
-        if self.ptt_active and self.stop_event is not None:
-            # аварийная остановка: если отпускание не поймали (чужое окно с правами
-            # администратора), хоткей работает как «стоп»
+        if self.recording and self.stop_event is not None:
+            # второе нажатие останавливает всегда: раньше после 15 с опрос сбрасывал
+            # ptt_active, и запись нельзя было остановить с клавиатуры вообще
             trace("ptt: повторное нажатие — останавливаю")
             self.stop_event.set()
             return
@@ -1216,7 +1348,6 @@ class App:
         self.ptt_active = True
         self._remember_target()
         self.stop_event = threading.Event()
-        HOOK_EVENT["event"] = self.stop_event
         self.recording = True
         self.busy = True
         self._set_record_state(True)
@@ -1228,21 +1359,33 @@ class App:
         threading.Thread(target=self._watch_release, args=(self.stop_event,), daemon=True).start()
 
     def _watch_release(self, event: threading.Event) -> None:
-        """Стоп по отпусканию, но только если мы реально видели клавиши зажатыми."""
-        time.sleep(0.05)
+        """Стоп по отпусканию клавиш фактической комбинации.
+
+        Хук для этого не используется: он не получает нажатий, когда активное окно
+        запущено от администратора. Раньше здесь были зашиты Ctrl+Alt+Space, из-за
+        чего режим «удерживать» не работал ни с каким другим хоткеем.
+        """
+        try:
+            keys = HOTKEYS.keys("dictate")
+        except ValueError:
+            keys = []
+        if not keys:
+            return
+        started = time.monotonic()
         seen_held = False
-        deadline = time.monotonic() + 15.0
-        while not event.is_set() and time.monotonic() < deadline:
-            held = all(USER32.GetAsyncKeyState(vk) & 0x8000
-                       for vk in (VK_CONTROL, VK_MENU, VK_SPACE))
+        while not event.is_set():
+            held = all(USER32.GetAsyncKeyState(vk) & 0x8000 for vk in keys)
             if held:
                 seen_held = True
-            elif seen_held:
-                self.ptt_active = False
-                event.set()
-                return
-            time.sleep(0.03)
+            elif seen_held or time.monotonic() - started > 0.3:
+                break
+            if time.monotonic() - started > 1800:      # страховка от забытой записи
+                break
+            time.sleep(0.025)
         self.ptt_active = False
+        if not event.is_set():
+            trace("ptt: клавиши отпущены, стоп")
+            event.set()
 
     def _record_and_transcribe(self, push_to_talk: bool = False) -> None:
         try:
@@ -1274,11 +1417,11 @@ class App:
             self.events.put(("status", f"Ошибка распознавания: {exc}"))
             self.events.put(("error", f"Не удалось распознать:\n{exc}\n\nПодробности — в журнале:\n{LOG}"))
         finally:
-            HOOK_EVENT["event"] = None
             self.recording = False
             self.busy = False
             self.ptt_active = False
             self.events.put(("reset_button", None))
+            self.events.put(("idle", None))
 
     def _level_cb(self, db: float, voiced: bool) -> None:
         # -60..0 дБ -> 0..100
@@ -1310,7 +1453,7 @@ class App:
                         self.hide_to_tray()
                         try:
                             self.icon.notify(
-                                f"Работает в трее. Диктовка — {HOTKEY_ACTUAL['dictate']}.",
+                                f"Работает в трее. Диктовка — {HOTKEYS.shown('dictate')}.",
                                 "Голосовой ввод")
                         except Exception:
                             pass
@@ -1337,12 +1480,7 @@ class App:
                 elif kind == "overlay":
                     self._overlay_show(*payload)
                 elif kind == "hotkey_changed":
-                    name, combo = payload
-                    if combo:
-                        self.status.set(f"Комбинация занята, {name} теперь {combo}")
-                        self.events.put(("overlay", (f"Хоткей заменён на {combo}", "#e0a33a", 3000)))
-                    else:
-                        self.status.set(f"Не удалось назначить хоткей {name}")
+                    self._on_hotkey_changed(*payload)
                 elif kind == "toggle":
                     self.toggle_recording()
                 elif kind == "show":
@@ -1355,6 +1493,8 @@ class App:
                 elif kind == "reset_button":
                     self._set_record_state(False)
                     self.level.set(0)
+                elif kind == "idle":
+                    self._apply_pending_model()
         except queue.Empty:
             pass
         except Exception:
@@ -1467,6 +1607,10 @@ class App:
 
 
 SINGLE_INSTANCE_HANDLE = None
+SHOW_EVENT = {"handle": None, "callback": None}
+SHOW_EVENT_NAME = "Local\\voice2text-show"
+EVENT_MODIFY_STATE = 0x0002
+WAIT_INFINITE = 0xFFFFFFFF
 
 
 def already_running() -> bool:
@@ -1475,8 +1619,49 @@ def already_running() -> bool:
         return False
     global SINGLE_INSTANCE_HANDLE
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateEventW.restype = ctypes.c_void_p
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.OpenEventW.restype = ctypes.c_void_p
+    kernel32.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     SINGLE_INSTANCE_HANDLE = kernel32.CreateMutexW(None, False, "Local\\voice2text-single")
     return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+
+
+def start_show_listener(callback) -> None:
+    """Первый экземпляр слушает событие: второй запуск просто просит показать окно."""
+    kernel32 = ctypes.windll.kernel32
+    SHOW_EVENT["callback"] = callback
+    SHOW_EVENT["handle"] = kernel32.CreateEventW(None, False, False, SHOW_EVENT_NAME)
+
+    def wait() -> None:
+        handle = SHOW_EVENT["handle"]
+        if not handle:
+            return
+        while True:
+            if kernel32.WaitForSingleObject(handle, WAIT_INFINITE) != 0:
+                return
+            if SHOW_EVENT["callback"] is not None:
+                SHOW_EVENT["callback"]()
+
+    threading.Thread(target=wait, daemon=True).start()
+
+
+def request_show() -> bool:
+    """Второй экземпляр просит первый показать окно. False — если он старый."""
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SHOW_EVENT_NAME)
+    if not handle:
+        return False
+    try:
+        kernel32.SetEvent(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+    return True
 
 
 def main() -> None:
@@ -1493,6 +1678,9 @@ def main() -> None:
 
 
 def _main() -> None:
+    if "--uninstall" in sys.argv:
+        from uninstall import run_uninstall
+        sys.exit(run_uninstall())
     try:
         marker = DATA / ".cache" / "start.marker"
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1502,13 +1690,16 @@ def _main() -> None:
         pass  # маркер нужен только для диагностики, падать из-за него нельзя
     root = ctk.CTk()
     if already_running():
-        root.withdraw()
-        messagebox.showinfo("Голосовой ввод",
-                            "Приложение уже запущено — ищите иконку в трее.")
+        # второй запуск просто поднимает окно первого, без окон-тупиков
+        if not request_show():
+            root.withdraw()
+            messagebox.showinfo("Голосовой ввод",
+                                "Приложение уже запущено — ищите иконку в трее.")
         root.destroy()
         return
-    config = Config.load()
+    config = Config.load(on_error=trace)
     app = App(root, config)
+    start_show_listener(lambda: app.events.put(("show", None)))
     # окно сворачивается только когда иконка трея реально создалась (см. tray_ready)
     app.start_hidden = bool(config["start_minimized"]) and "--show" not in sys.argv
     root.mainloop()

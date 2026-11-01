@@ -33,6 +33,12 @@ Write-Host "Archive: $($archive.FullName) ($([math]::Round($archive.Length / 1MB
 Write-Host "Tag:     $tag"
 Write-Host "Repo:    $Repo"
 
+# sha256 рядом с архивом: приложение сверяет его перед установкой
+$hashFile = "$($archive.FullName).sha256"
+$hash = (Get-FileHash -Algorithm SHA256 -Path $archive.FullName).Hash.ToLower()
+Set-Content -Path $hashFile -Value $hash -Encoding ascii -NoNewline
+Write-Host "SHA256:  $hash"
+
 # Release notes: the section of CHANGELOG.md for this version.
 $notes = ""
 $startLine = 0
@@ -72,9 +78,9 @@ if (-not $Token -and (Test-Gh)) {
     Write-Host "Publishing through GitHub CLI..."
     & gh release view $tag --repo $Repo 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
-        & gh release upload $tag $archive.FullName --repo $Repo --clobber
+        & gh release upload $tag $archive.FullName $hashFile --repo $Repo --clobber
     } else {
-        & gh release create $tag $archive.FullName --repo $Repo --title "Voice2Text $version" --notes-file $notesFile
+        & gh release create $tag $archive.FullName $hashFile --repo $Repo --title "Voice2Text $version" --notes-file $notesFile
     }
     if ($LASTEXITCODE -ne 0) { throw "gh release failed with code $LASTEXITCODE" }
     Write-Host "Release page: https://github.com/$Repo/releases/tag/$tag"
@@ -125,4 +131,8 @@ if (-not $release) {
 $uploadUrl = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$($archive.Name)"
 Write-Host "Uploading $($archive.Name)..."
 Invoke-RestMethod -Uri $uploadUrl -Headers $headers -Method Post -InFile $archive.FullName -ContentType "application/zip" | Out-Null
+
+$hashUrl = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$([IO.Path]::GetFileName($hashFile))"
+Write-Host "Uploading $([IO.Path]::GetFileName($hashFile))..."
+Invoke-RestMethod -Uri $hashUrl -Headers $headers -Method Post -InFile $hashFile -ContentType "text/plain" | Out-Null
 Write-Host "Release page: https://github.com/$Repo/releases/tag/$tag"

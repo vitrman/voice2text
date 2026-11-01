@@ -1,21 +1,30 @@
 """Обновление приложения из GitHub Releases.
 
 Работает без токена и без gh: читает последний релиз через публичный API,
-сравнивает версии, скачивает `*-installer.zip` (с докачкой и отменой),
+сравнивает версии, скачивает `*-installer.zip` (с проверкой sha256 и отменой),
 запускает установку в тихом режиме и перезапускает приложение.
-Пользовательские данные (конфиг, модель, журналы) лежат в %LOCALAPPDATA%, поэтому
-замена папки программы их не затрагивает.
+
+Установщику передаётся `/WAITPID=<наш pid>`: он сам ждёт выхода приложения,
+ставит версию поверх и запускает exe. Раньше для этого писался пакетный файл
+с путями внутри, и на машинах с кириллицей в имени пользователя cmd читал их
+в чужой кодировке — обновление молча не устанавливалось.
+
+Пользовательские данные (конфиг, модель, журналы) лежат в %LOCALAPPDATA%,
+поэтому замена папки программы их не затрагивает.
 """
 
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -27,6 +36,7 @@ TIMEOUT = 20
 CHUNK = 1 << 20
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
+CACHE_KEEP_DAYS = 7
 
 
 class UpdateError(RuntimeError):
@@ -64,8 +74,32 @@ def _request(url: str):
         raise
 
 
+def _read_small(url: str, limit: int = 4096) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return response.read(limit).decode("utf-8", "replace")
+
+
+def _sha_from_release(data: dict, asset: dict) -> str:
+    """sha256 архива: поле digest у файла или отдельный `*.zip.sha256` в релизе."""
+    digest = str(asset.get("digest") or "")
+    if digest.lower().startswith("sha256:"):
+        return digest.split(":", 1)[1].strip().lower()
+    for item in data.get("assets") or []:
+        name = str(item.get("name") or "").lower()
+        if not name.endswith("installer.zip.sha256"):
+            continue
+        try:
+            parts = _read_small(item.get("browser_download_url") or "").split()
+        except Exception:
+            continue
+        if parts and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    return ""
+
+
 def fetch_latest(repo: str) -> dict:
-    """Последний опубликованный релиз: {'version', 'url', 'name', 'size', 'page'}."""
+    """Последний опубликованный релиз: версия, ссылка, размер и sha256."""
     with _request(API.format(repo=repo)) as response:
         data = json.loads(response.read().decode("utf-8"))
 
@@ -87,6 +121,7 @@ def fetch_latest(repo: str) -> dict:
         "name": asset["name"],
         "url": asset["browser_download_url"],
         "size": int(asset.get("size") or 0),
+        "sha256": _sha_from_release(data, asset),
         "page": data.get("html_url") or "",
     }
 
@@ -119,7 +154,29 @@ def cached(name: str, size: int = 0) -> Path | None:
     return path
 
 
-def download(url: str, name: str, on_progress=None, cancel=None, expected_size: int = 0) -> Path:
+def verify_archive(archive: Path, expected_sha: str = "") -> None:
+    """Проверяет архив до запуска установки: хеш и целостность zip."""
+    if expected_sha:
+        digest = hashlib.sha256()
+        with open(archive, "rb") as fh:
+            for block in iter(lambda: fh.read(CHUNK), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected_sha:
+            archive.unlink(missing_ok=True)
+            raise UpdateError("архив обновления повреждён (не совпал sha256), скачайте ещё раз")
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            broken = bundle.testzip()
+    except (OSError, zipfile.BadZipFile) as exc:
+        archive.unlink(missing_ok=True)
+        raise UpdateError(f"архив обновления повреждён: {exc}") from exc
+    if broken:
+        archive.unlink(missing_ok=True)
+        raise UpdateError(f"архив обновления повреждён: файл {broken}")
+
+
+def download(url: str, name: str, on_progress=None, cancel=None, expected_size: int = 0,
+             expected_sha: str = "") -> Path:
     """Качает архив в %TEMP%\\voice2text-update; повторно не качает уже скачанное."""
     target = archive_path(name)
     ready = cached(name, expected_size)
@@ -130,6 +187,7 @@ def download(url: str, name: str, on_progress=None, cancel=None, expected_size: 
 
     part = target.with_suffix(target.suffix + ".part")
     part.unlink(missing_ok=True)
+    digest = hashlib.sha256()
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response, open(part, "wb") as out:
         total = expected_size or int(response.headers.get("Content-Length") or 0)
@@ -143,6 +201,7 @@ def download(url: str, name: str, on_progress=None, cancel=None, expected_size: 
             if not block:
                 break
             out.write(block)
+            digest.update(block)
             done += len(block)
             if on_progress is not None:
                 on_progress(done, total)
@@ -151,6 +210,9 @@ def download(url: str, name: str, on_progress=None, cancel=None, expected_size: 
     if expected_size and size != expected_size:
         part.unlink(missing_ok=True)
         raise UpdateError(f"архив скачался не целиком ({size} из {expected_size} байт)")
+    if expected_sha and digest.hexdigest() != expected_sha:
+        part.unlink(missing_ok=True)
+        raise UpdateError("архив обновления повреждён (не совпал sha256)")
     part.replace(target)
     return target
 
@@ -159,7 +221,6 @@ def unpack(archive: Path) -> Path:
     """Распаковывает установщик во временную папку и возвращает путь к setup.exe."""
     folder = cache_dir() / f"unpacked-{archive.stem}"
     if folder.exists():
-        import shutil
         shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive) as bundle:
@@ -170,37 +231,81 @@ def unpack(archive: Path) -> Path:
 
 
 def apply(archive: Path, target: Path | None, pid: int | None = None) -> Path:
-    """Готовит тихое обновление и запускает его после выхода приложения.
+    """Запускает установщик, передав ему PID: он дождётся выхода приложения.
 
-    Возвращает путь к скрипту-помощнику: он ждёт завершения текущего процесса,
-    ставит новую версию поверх папки программы и запускает exe снова.
+    Аргументы процесса — Unicode, поэтому кириллица в путях безопасна.
     """
     setup = unpack(archive)
     if target is None:
         raise UpdateError("обновление доступно только для установленной версии")
-    exe = target / "Voice2Text.exe"
-    folder = cache_dir()
-    helper = folder / "apply-update.cmd"
-    log = folder / "install.log"
-    wait_pid = pid or os.getpid()
-    lines = [
-        "@echo off",
-        "chcp 65001 >nul",
-        ":wait",
-        f'tasklist /FI "PID eq {wait_pid}" 2>nul | find "{wait_pid}" >nul',
-        "if errorlevel 1 goto :run",
-        "ping -n 2 127.0.0.1 >nul",
-        "goto :wait",
-        ":run",
-        f'"{setup}" /S /D="{target}" >> "{log}" 2>&1',
-        f'if exist "{exe}" start "" "{exe}"',
-        "exit /b",
-    ]
-    helper.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-    subprocess.Popen(["cmd", "/c", str(helper)],
+    subprocess.Popen([str(setup), "/S", f"/D={target}", f"/WAITPID={pid or os.getpid()}"],
                      creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
                      close_fds=True)
-    return helper
+    return setup
+
+
+def _dir_size(folder: Path) -> int:
+    total = 0
+    for path in folder.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def cleanup_cache(current_version: str) -> int:
+    """Убирает отработавшие архивы и распаковки обновлений; возвращает освобождённые байты.
+
+    Кэш нельзя чистить сразу после установки: он же служит «уже скачано, не качай
+    заново». Зато на следующем запуске приложение точно работает с новой версии,
+    значит всё, что не новее её, больше не нужно.
+    """
+    folder = cache_dir()
+    current = version_tuple(current_version)
+    now = time.time()
+    freed = 0
+    for entry in list(folder.iterdir()):
+        try:
+            old = now - entry.stat().st_mtime > CACHE_KEEP_DAYS * 86400
+            if entry.is_dir():
+                match = re.search(r"(\d+\.\d+\.\d+\.\d+)", entry.name)
+                version = version_tuple(match.group(1)) if match else (0, 0, 0, 0)
+                if old or version <= current:
+                    freed += _dir_size(entry)
+                    shutil.rmtree(entry, ignore_errors=True)
+                continue
+            if entry.name.endswith(".part"):
+                freed += entry.stat().st_size
+                entry.unlink(missing_ok=True)
+                continue
+            match = re.search(r"(\d+\.\d+\.\d+\.\d+)", entry.name)
+            version = version_tuple(match.group(1)) if match else None
+            if old or (version is not None and version <= current):
+                freed += entry.stat().st_size
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
+    return freed
+
+
+def cleanup_install_leftovers(target: Path | None, days: int = 1) -> int:
+    """Удаляет `*.old`, оставшиеся от неудачных установок рядом с exe."""
+    if target is None or not target.is_dir():
+        return 0
+    now = time.time()
+    freed = 0
+    for path in target.glob("*.old"):
+        try:
+            if now - path.stat().st_mtime < days * 86400:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            freed += size
+        except OSError:
+            continue
+    return freed
 
 
 def is_admin() -> bool:

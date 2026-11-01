@@ -3,7 +3,7 @@
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-hiddenimports = ["PIL._tkinter_finder", "pystray._win32"]
+hiddenimports = ["PIL._tkinter_finder", "pystray._win32", "uninstall"]
 for package in ("gigaam", "pystray", "hydra", "omegaconf", "sounddevice", "sentencepiece"):
     try:
         hiddenimports += collect_submodules(package)

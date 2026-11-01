@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -260,7 +261,10 @@ class GigaAMEngine:
         self._on_progress = on_progress
         self._model = None
         self._name = model_name
-        self._lock_guard = __import__("threading").Lock()
+        self._lock_guard = threading.Lock()
+        # загрузка идёт и из прогрева, и из распознавания: без блокировки оба
+        # потока видели «модели нет» и грузили 428 МБ одновременно
+        self._load_lock = threading.Lock()
         self.load_seconds = 0.0
 
     @property
@@ -270,6 +274,20 @@ class GigaAMEngine:
     def load(self) -> None:
         if self._model is not None:
             return
+        with self._load_lock:
+            if self._model is not None:      # успели загрузить, пока ждали блокировку
+                return
+            self._load()
+
+    def dispose(self) -> None:
+        """Освобождает модель: при смене модели в памяти оставался старый чекпойнт."""
+        with self._load_lock:
+            self._model = None
+        import gc
+
+        gc.collect()
+
+    def _load(self) -> None:
         started = time.perf_counter()
         import gigaam  # тяжёлый импорт: torch подтягивается здесь
 
@@ -287,17 +305,22 @@ class GigaAMEngine:
             self._log(f"подготовка модели не удалась:\n{traceback.format_exc()}")
 
         errors = []
+        loaded = None
+        loaded_name = self._name
         for name in ([self._name] if self._name else CANDIDATES):
             try:
                 self._log(f"загружаю модель {name} …")
-                self._model = gigaam.load_model(name, download_root=str(model_dir))
-                self._name = name
+                loaded = gigaam.load_model(name, download_root=str(model_dir))
+                loaded_name = name
                 break
             except Exception as exc:  # модель может отсутствовать в установленной версии
                 errors.append(f"{name}: {exc}")
                 self._log(f"  не удалось: {exc}")
-        if self._model is None:
+        if loaded is None:
+            self._name = None
             raise RuntimeError("Ни одна модель GigaAM не загрузилась:\n" + "\n".join(errors))
+        self._model = loaded
+        self._name = loaded_name
         self.load_seconds = time.perf_counter() - started
         self._log(f"модель {self._name} готова за {self.load_seconds:.1f} с")
 

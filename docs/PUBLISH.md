@@ -44,7 +44,9 @@ release_github.cmd    :: опубликовать Release с архивом ус
 2. **Choose a tag** → выбрать существующий тег `v<версия>` (например `v0.7.3.1`).
 3. Заголовок: `Voice2Text <версия>`.
 4. Описание: скопировать раздел текущей версии из `CHANGELOG.md`.
-5. **Attach binaries** → `dist-installer\Voice2Text-<версия>-installer.zip`
+5. **Attach binaries** → `dist-installer\Voice2Text-<версия>-installer.zip` и рядом
+   `…-installer.zip.sha256` (приложение сверяет хеш перед установкой; `release_github.cmd`
+   загружает оба файла сам)
    (файл больше 100 МБ в git не кладётся, только в Assets релиза).
 6. **Publish release**.
 

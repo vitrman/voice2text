@@ -1,7 +1,8 @@
-"""Проверки обновления без сети: кэш, отмена, скрипт-помощник, установка поверх."""
+"""Проверки обновления без сети: кэш, отмена, передача PID, установка поверх."""
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -58,7 +59,8 @@ def test_cache_and_cancel() -> None:
     print("кэш и отмена: ок")
 
 
-def test_apply_helper() -> None:
+def test_apply_passes_pid() -> None:
+    """Установщик получает PID: помощника .cmd с путями внутри больше нет."""
     work = Path(tempfile.gettempdir()) / "upd-apply-test"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
@@ -79,15 +81,24 @@ def test_apply_helper() -> None:
 
     subprocess.Popen = fake_popen
     try:
-        helper = update.apply(archive, target, pid=424242)
+        setup = update.apply(archive, target, pid=424242)
     finally:
         subprocess.Popen = original
-    text = helper.read_text(encoding="utf-8")
-    assert "PID eq 424242" in text, "скрипт не ждёт завершения приложения"
-    assert "/S /D=" in text, "нет тихой установки"
-    assert 'start ""' in text, "нет перезапуска"
+    assert setup.name.lower() == "setup.exe", setup
+    args = [str(item) for item in captured["args"]]
+    assert "/S" in args, args
+    assert f"/D={target}" in args, args
+    assert "/WAITPID=424242" in args, args
     assert captured["flags"], "процесс запущен без флагов отсоединения"
-    print("скрипт-помощник: ок")
+    print("передача PID установщику: ок")
+
+
+def test_wait_for_process() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "pass"],
+                             creationflags=0x08000000)
+    assert setup_app.wait_for_process(child.pid, timeout=30), "не дождались процесса"
+    child.wait(timeout=30)
+    print("ожидание процесса по PID: ок")
 
 
 def test_install_over_existing() -> None:
@@ -97,6 +108,8 @@ def test_install_over_existing() -> None:
     target.mkdir(parents=True)
     (target / "Voice2Text.exe").write_bytes(b"MZ-old")
     (target / "stale.txt").write_text("old", encoding="utf-8")
+    (target / "_internal").mkdir()
+    (target / "_internal" / "old.dll").write_bytes(b"old")
     payload = work / "payload.zip"
     with zipfile.ZipFile(payload, "w") as archive_file:
         archive_file.writestr("Voice2Text.exe", b"MZ-new")
@@ -108,11 +121,68 @@ def test_install_over_existing() -> None:
     assert (target / "Voice2Text.exe").read_bytes() == b"MZ-new", "exe не заменился"
     assert (target / "_internal/lib.txt").is_file(), "новые файлы не распакованы"
     assert not (target / "Voice2Text.exe.old").exists(), "остался .old"
-    print("установка поверх: ок")
+    assert not (target / "stale.txt").exists(), "остался файл прошлой версии"
+    assert not (target / "_internal/old.dll").exists(), "осталась старая библиотека"
+    print("установка поверх и чистка старых файлов: ок")
+
+
+def test_verify_archive() -> None:
+    work = Path(tempfile.gettempdir()) / "upd-verify-test"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir()
+    archive = work / "Voice2Text-9.9.9-installer.zip"
+    with zipfile.ZipFile(archive, "w") as archive_file:
+        archive_file.writestr("payload.txt", "ok")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    update.verify_archive(archive, digest)
+    assert archive.exists()
+
+    try:
+        update.verify_archive(archive, "0" * 64)
+    except update.UpdateError:
+        pass
+    else:
+        raise AssertionError("несовпадение sha256 не поймано")
+    assert not archive.exists(), "битый архив не удалён"
+
+    broken = work / "broken.zip"
+    broken.write_bytes(b"not a zip at all")
+    try:
+        update.verify_archive(broken)
+    except update.UpdateError:
+        pass
+    else:
+        raise AssertionError("битый zip не пойман")
+    print("проверка sha256 и zip: ок")
+
+
+def test_cleanup_cache() -> None:
+    work = Path(tempfile.gettempdir()) / "upd-cleanup-test"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir()
+    original = update.cache_dir
+    update.cache_dir = lambda: work
+    try:
+        (work / "Voice2Text-0.1.1.1-installer.zip").write_bytes(b"old")
+        (work / "Voice2Text-9.9.9.1-installer.zip").write_bytes(b"new")
+        unpacked = work / "unpacked-Voice2Text-0.1.1.1-installer"
+        unpacked.mkdir()
+        (unpacked / "setup.exe").write_bytes(b"MZ")
+        freed = update.cleanup_cache("0.8.6.1")
+    finally:
+        update.cache_dir = original
+    assert freed > 0, "ничего не освободилось"
+    assert not (work / "Voice2Text-0.1.1.1-installer.zip").exists(), "старый архив остался"
+    assert (work / "Voice2Text-9.9.9.1-installer.zip").exists(), "новый архив удалён"
+    assert not unpacked.exists(), "старая распаковка осталась"
+    print("уборка кэша обновлений: ок")
 
 
 if __name__ == "__main__":
     test_cache_and_cancel()
-    test_apply_helper()
+    test_apply_passes_pid()
+    test_wait_for_process()
     test_install_over_existing()
+    test_verify_archive()
+    test_cleanup_cache()
     print("все проверки обновления прошли")

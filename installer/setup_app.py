@@ -88,25 +88,16 @@ def make_shortcut(link: Path, target: Path, workdir: Path, icon: Path) -> None:
                    creationflags=CREATE_NO_WINDOW, check=False)
 
 
-def write_uninstall_script(target: Path, shortcuts: list[Path]) -> Path:
-    script = target / "Uninstall.cmd"
-    lines = ["@echo off"]
-    for link in shortcuts:
-        lines.append(f'del "{link}" >nul 2>&1')
-    lines.append(f'reg delete "HKCU\\{UNINSTALL_KEY}" /f >nul 2>&1')
-    lines.append(f'start "" /min cmd /c rmdir /s /q "{target}"')
-    script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-    return script
-
-
-def register_uninstall(target: Path, uninstall: Path, exe: Path, version: str) -> None:
+def register_uninstall(target: Path, exe: Path, version: str) -> None:
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as key:
         winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, f"{APP_TITLE} (GigaAM)")
         winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, version)
         winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, str(exe))
         winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, str(target))
         winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "GigaAM (локальная сборка)")
-        winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'"{uninstall}"')
+        # удаление идёт через сам exe: пути передаются аргументом (Unicode), а не
+        # текстом пакетного файла, иначе кириллица в пути ломает удаление
+        winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'"{exe}" --uninstall')
         winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
         size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
@@ -131,6 +122,35 @@ def extract(payload: Path, target: Path, progress) -> None:
             progress(index / total, f"Распаковка: {item.filename}")
 
 
+def prune(payload: Path, target: Path) -> int:
+    """Удаляет файлы, которых нет в новой версии.
+
+    Ставим поверх (иначе занятые файлы ломают установку), но старые библиотеки
+    от прошлых сборок остаются и могут подхватиться вместо новых. Чистим после
+    распаковки: сбой на этом шаге не оставляет приложение полуустановленным.
+    """
+    with zipfile.ZipFile(payload) as archive:
+        expected = {item.filename.replace("\\", "/").lower()
+                    for item in archive.infolist() if not item.is_dir()}
+    keep = {(EXE_NAME + ".old").lower()}
+    removed = 0
+    for path in sorted(target.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        try:
+            if path.is_dir():
+                if not any(path.iterdir()):
+                    path.rmdir()
+                continue
+            relative = path.relative_to(target).as_posix().lower()
+            if relative in expected or relative in keep:
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            removed += size
+        except OSError:
+            continue
+    return removed
+
+
 def install(target: Path, *, icons: bool, registry: bool, progress) -> Path:
     payload = payload_file()
     version = app_version()
@@ -145,6 +165,9 @@ def install(target: Path, *, icons: bool, registry: bool, progress) -> Path:
             raise RuntimeError("Приложение запущено. Закройте его и повторите установку.") from exc
     try:
         extract(payload, target, progress)
+        pruned = prune(payload, target)
+        if pruned:
+            log_line(f"удалены файлы прошлых версий: {pruned / 2 ** 20:.1f} МБ")
     except Exception:
         # не оставляем пользователя без приложения, если распаковка сорвалась
         if old_exe.exists() and not (target / EXE_NAME).exists():
@@ -166,9 +189,8 @@ def install(target: Path, *, icons: bool, registry: bool, progress) -> Path:
             make_shortcut(link, exe, target, exe)
             shortcuts.append(link)
         progress(0.98, "Ярлыки созданы")
-    uninstall = write_uninstall_script(target, shortcuts)
     if registry:
-        register_uninstall(target, uninstall, exe, version)
+        register_uninstall(target, exe, version)
     progress(1.0, "Готово")
     return exe
 
@@ -188,22 +210,49 @@ def log_line(message: str) -> None:
         pass
 
 
+def wait_for_process(pid: int, timeout: float = 90.0) -> bool:
+    """Ждёт завершения процесса по PID через WinAPI, без tasklist и ping."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_uint]
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    synchronize = 0x00100000
+    handle = kernel32.OpenProcess(synchronize, False, int(pid))
+    if not handle:
+        return True                     # процесса уже нет
+    try:
+        return kernel32.WaitForSingleObject(handle, int(timeout * 1000)) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def run_silent(arguments: list[str]) -> int:
     target = default_target()
     icons = registry = launch = True
+    wait_pid = 0
     for arg in arguments:
         # путь может прийти в кавычках: "/D=C:\Program Files\Voice2Text"
         arg = arg.strip('"')
         low = arg.lower()
         if low.startswith("/d="):
             target = Path(arg[3:].strip('"'))
+        elif low.startswith("/waitpid="):
+            try:
+                wait_pid = int(arg.split("=", 1)[1])
+            except ValueError:
+                wait_pid = 0
         elif low == "/noicons":
             icons = False
         elif low == "/noreg":
             registry = False
         elif low == "/norun":
             launch = False
-    log_line(f"тихая установка: target={target} icons={icons} reg={registry} run={launch}")
+    log_line(f"тихая установка: target={target} icons={icons} reg={registry} run={launch} pid={wait_pid}")
+    if wait_pid:
+        log_line(f"жду завершения процесса {wait_pid}")
+        if not wait_for_process(wait_pid):
+            log_line("процесс не завершился за 90 с, продолжаю установку")
     try:
         exe = install(target, icons=icons, registry=registry,
                       progress=lambda part, text: log_line(f"{part * 100:3.0f}% {text}"))

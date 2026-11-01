@@ -58,7 +58,8 @@ def main() -> int:
     expected = len(speech) / 16000
     print(f"речь {expected:.1f} с -> записано {got:.1f} с")
     assert got >= expected * 0.9, "речь обрезана"
-    assert got < expected + 1.0, "VAD не остановился после паузы"
+    # к речи добавляются 400 мс предзаписи и 700 мс паузы до автостопа
+    assert got < expected + 1.3, "VAD не остановился после паузы"
 
     try:
         silence = run(np.zeros(16000 * 3, np.float32))

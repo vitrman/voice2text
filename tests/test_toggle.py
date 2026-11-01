@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sys
 import time
-import tkinter as tk
 from pathlib import Path
+
+import customtkinter as ctk
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -13,8 +14,26 @@ sys.path.insert(0, str(ROOT))
 import app as app_module  # noqa: E402
 
 
+class DummyEngine:
+    """Без torch и модели: проверяем только логику переключателя."""
+
+    def __init__(self, *args, **kwargs):
+        self.name = "dummy"
+
+    def load(self) -> None:
+        pass
+
+    def transcribe(self, audio, **kwargs) -> str:
+        return ""
+
+    def dispose(self) -> None:
+        pass
+
+
 def main() -> int:
-    root = tk.Tk()
+    app_module.GigaAMEngine = DummyEngine
+    app_module.App._setup_tray = lambda self: False   # трей под песочницей недоступен
+    root = ctk.CTk()
     root.withdraw()
     instance = app_module.App(root, app_module.Config({"hotkey_mode": "toggle"}))
     instance._record_and_transcribe = lambda *args, **kwargs: time.sleep(5)

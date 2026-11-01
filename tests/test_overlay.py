@@ -10,10 +10,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import customtkinter as ctk
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
 import app as app_module  # noqa: E402
 
 
-def pump(root: tk.Tk, seconds: float) -> None:
+class DummyEngine:
+    """Без torch и модели: проверяем только индикатор."""
+
+    def __init__(self, *args, **kwargs):
+        self.name = "dummy"
+
+    def load(self) -> None:
+        pass
+
+    def transcribe(self, audio, **kwargs) -> str:
+        return ""
+
+    def dispose(self) -> None:
+        pass
+
+
+def pump(root: ctk.CTk, seconds: float) -> None:
     deadline = time.time() + seconds
     while time.time() < deadline:
         root.update()
@@ -21,7 +42,9 @@ def pump(root: tk.Tk, seconds: float) -> None:
 
 
 def main() -> int:
-    root = tk.Tk()
+    app_module.GigaAMEngine = DummyEngine
+    app_module.App._setup_tray = lambda self: False
+    root = ctk.CTk()
     instance = app_module.App(root)
     instance.start_hidden = False
 
