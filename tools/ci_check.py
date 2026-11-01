@@ -37,6 +37,12 @@ def main() -> int:
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert version.VERSION in changelog, "нет записи о текущей версии в CHANGELOG.md"
 
+    # powershell.exe (5.1) без BOM читает .ps1 как ANSI: русский текст ломается,
+    # а скрипт публикации перестаёт разбираться синтаксически
+    script = ROOT / "tools" / "publish_release.ps1"
+    assert script.read_bytes().startswith(b"\xef\xbb\xbf"), (
+        "tools/publish_release.ps1 должен быть в UTF-8 с BOM")
+
     print(f"ok: {version.VERSION}")
     return 0
 

@@ -4,6 +4,9 @@
 #
 #   -DryRun        print what would be published, no network calls
 #   -Token <pat>   use this token instead of asking / $env:GITHUB_TOKEN
+#   -NewToken      ask for a token again and replace the saved one
+#   -SaveToken     save the token without the question
+#   -Forget        delete the saved token and exit
 #   -Repo owner/name  override the repository (default vitrman/voice2text)
 
 param(
@@ -11,11 +14,61 @@ param(
     [string]$Repo = "vitrman/voice2text",
     [switch]$DryRun,
     [switch]$Forget,
-    [switch]$SaveToken
+    [switch]$SaveToken,
+    [switch]$NewToken
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+# Токен лежит в данных приложения и зашифрован DPAPI для текущей учётной записи
+# Windows: другой пользователь или другая машина его не прочитают.
+# Забыть/заменить: -Forget и -NewToken (см. docs/PUBLISH.md).
+$TokenFile = Join-Path $env:LOCALAPPDATA "voice2text\github.token"
+
+function Get-StoredToken {
+    if (-not (Test-Path $TokenFile)) { return "" }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [IO.File]::ReadAllBytes($TokenFile)
+        $plain = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, "CurrentUser")
+        return [Text.Encoding]::UTF8.GetString($plain).Trim()
+    } catch {
+        Write-Host "Сохранённый токен не читается (файл от другой учётной записи?)." -ForegroundColor Yellow
+        return ""
+    }
+}
+
+function Save-StoredToken([string]$value) {
+    if (-not $value) { return }
+    Add-Type -AssemblyName System.Security
+    $folder = Split-Path -Parent $TokenFile
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($value)
+    $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, "CurrentUser")
+    [IO.File]::WriteAllBytes($TokenFile, $protected)
+}
+
+function Remove-StoredToken {
+    if (-not (Test-Path $TokenFile)) { return $true }
+    try {
+        Remove-Item $TokenFile -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Host "Не удалось удалить $TokenFile : $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+if ($Forget) {
+    if (Remove-StoredToken) {
+        Write-Host "Сохранённый токен удалён: $TokenFile"
+        Write-Host "Следующий запуск снова спросит токен."
+        exit 0
+    }
+    Write-Host "Токен не удалён. Закройте программы, которые держат файл, и повторите." -ForegroundColor Red
+    exit 1
+}
 
 $versionText = Get-Content (Join-Path $root "version.py") -Raw
 $match = [regex]::Match($versionText, 'VERSION\s*=\s*"([^"]+)"')
@@ -78,44 +131,9 @@ function Test-Gh {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Токен можно один раз сохранить: файл шифруется DPAPI для текущей учётной записи
-# Windows, поэтому другой пользователь или другая машина его не прочитают.
-# Лежит в %LOCALAPPDATA%\voice2text\github.token и в репозиторий не попадает.
-$TokenFile = Join-Path $env:LOCALAPPDATA "voice2text\github.token"
-
-function Get-StoredToken {
-    if (-not (Test-Path $TokenFile)) { return "" }
-    try {
-        Add-Type -AssemblyName System.Security
-        $bytes = [IO.File]::ReadAllBytes($TokenFile)
-        $plain = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, "CurrentUser")
-        return [Text.Encoding]::UTF8.GetString($plain).Trim()
-    } catch {
-        Write-Host "Сохранённый токен не читается (файл от другой учётной записи?)." -ForegroundColor Yellow
-        return ""
-    }
-}
-
-function Save-StoredToken([string]$value) {
-    if (-not $value) { return }
-    Add-Type -AssemblyName System.Security
-    $folder = Split-Path -Parent $TokenFile
-    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
-    $bytes = [Text.Encoding]::UTF8.GetBytes($value)
-    $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, "CurrentUser")
-    [IO.File]::WriteAllBytes($TokenFile, $protected)
-}
-
-function Remove-StoredToken {
-    if (Test-Path $TokenFile) { Remove-Item $TokenFile -Force }
-}
-
-if ($Forget) {
-    Remove-StoredToken
-    Write-Host "Сохранённый токен удалён: $TokenFile"
-    exit 0
-}
-
+# -NewToken: заменить сохранённый токен, даже если он уже есть
+if ($Token) { $Token = $Token.Trim() }
+if ($NewToken) { $Token = "" }
 if (-not $Token) { $Token = Get-StoredToken }
 
 if (-not $Token -and (Test-Gh)) {
@@ -135,7 +153,7 @@ if (-not $Token) {
     $secure = Read-Host "GitHub token with repo scope (input hidden)" -AsSecureString
     $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try {
-        $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto($pointer)
+        $Token = [Runtime.InteropServices.Marshal]::PtrToStringAuto($pointer).Trim()
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
     }
@@ -166,11 +184,11 @@ try {
         Write-Host "  - проверьте имя: release_github.cmd -Repo owner/name (сейчас $Repo)"
         Write-Host "  - classic-токен: нужен scope repo"
         Write-Host "  - fine-grained: выберите этот репозиторий и право Contents: Read and write"
-        Write-Host "  - если сохранён неверный токен: release_github.cmd -Forget"
+        Write-Host "  - неверный сохранённый токен: release_github.cmd -NewToken (или -Forget)"
         exit 1
     }
     if ($code -eq 401) {
-        Write-Host "GitHub не принял токен (401). Удалите сохранённый: release_github.cmd -Forget" -ForegroundColor Red
+        Write-Host "GitHub не принял токен (401). Замените его: release_github.cmd -NewToken" -ForegroundColor Red
         exit 1
     }
     $detail = $_.ErrorDetails.Message
