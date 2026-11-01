@@ -40,9 +40,11 @@ Set-Content -Path $hashFile -Value $hash -Encoding ascii -NoNewline
 Write-Host "SHA256:  $hash"
 
 # Release notes: the section of CHANGELOG.md for this version.
+# CHANGELOG в UTF-8, а powershell.exe (5.1) по умолчанию читает файлы как ANSI:
+# без -Encoding UTF8 русский текст превращался в мусор ещё до отправки.
 $notes = ""
 $startLine = 0
-$lines = Get-Content (Join-Path $root "CHANGELOG.md")
+$lines = Get-Content (Join-Path $root "CHANGELOG.md") -Encoding UTF8
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match ("^##\s+" + [regex]::Escape($version) + "\s*$")) {
         $startLine = $i + 1
@@ -59,7 +61,7 @@ if ($startLine -gt 0) {
 }
 if (-not $notes) { $notes = "Voice2Text $version" }
 $notesFile = Join-Path $env:TEMP "voice2text-notes-$version.md"
-Set-Content -Path $notesFile -Value $notes -Encoding UTF8
+[IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "Notes:   $notesFile"
 
 if ($DryRun) {
@@ -122,8 +124,19 @@ if (-not $release) {
         body       = $notes
         draft      = $false
         prerelease = $false
-    } | ConvertTo-Json
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" -Headers $headers -Method Post -Body $body -ContentType "application/json"
+    } | ConvertTo-Json -Depth 5
+    # GitHub ждёт UTF-8: если отдать строку, powershell.exe кодирует её в ANSI,
+    # кириллица превращается в невалидный UTF-8 и приходит "Problems parsing JSON"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases" `
+            -Headers $headers -Method Post -Body $bytes `
+            -ContentType "application/json; charset=utf-8"
+    } catch {
+        $detail = $_.ErrorDetails.Message
+        if ($detail) { Write-Host "GitHub: $detail" -ForegroundColor Red }
+        throw
+    }
 } else {
     Write-Host "Release exists, uploading asset..."
 }
