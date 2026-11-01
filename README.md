@@ -75,8 +75,11 @@ release_github.cmd -DryRun   :: только показать версию, те
 ```
 
 `release_github.cmd` публикует через GitHub CLI, если он установлен и выполнен `gh auth login`;
-иначе один раз спросит personal access token с правом `repo` (можно передать заранее в
-переменной `GITHUB_TOKEN`). Тег должен быть уже на GitHub — сначала `push.cmd`.
+иначе берёт personal access token с правом `repo` (или `Contents: Read and write` у
+fine-grained токена). Токен можно сохранить один раз: он шифруется для вашей учётной
+записи Windows в `%LOCALAPPDATA%\voice2text\github.token`, в репозиторий не попадает;
+`release_github.cmd -Forget` удаляет сохранённый токен. Тег должен быть уже на GitHub —
+сначала `push.cmd`.
 
 По отдельности, если нужно только приложение или только установщик:
 

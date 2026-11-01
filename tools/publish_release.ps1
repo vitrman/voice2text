@@ -1,4 +1,4 @@
-# Publishes a GitHub release with the installer from dist-installer.
+﻿# Publishes a GitHub release with the installer from dist-installer.
 # Works through GitHub CLI (gh) if signed in, otherwise through the REST API
 # with a personal access token (repo scope).
 #
@@ -9,7 +9,9 @@
 param(
     [string]$Token = $env:GITHUB_TOKEN,
     [string]$Repo = "vitrman/voice2text",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Forget,
+    [switch]$SaveToken
 )
 
 $ErrorActionPreference = "Stop"
@@ -76,6 +78,46 @@ function Test-Gh {
     return ($LASTEXITCODE -eq 0)
 }
 
+# Токен можно один раз сохранить: файл шифруется DPAPI для текущей учётной записи
+# Windows, поэтому другой пользователь или другая машина его не прочитают.
+# Лежит в %LOCALAPPDATA%\voice2text\github.token и в репозиторий не попадает.
+$TokenFile = Join-Path $env:LOCALAPPDATA "voice2text\github.token"
+
+function Get-StoredToken {
+    if (-not (Test-Path $TokenFile)) { return "" }
+    try {
+        Add-Type -AssemblyName System.Security
+        $bytes = [IO.File]::ReadAllBytes($TokenFile)
+        $plain = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, "CurrentUser")
+        return [Text.Encoding]::UTF8.GetString($plain).Trim()
+    } catch {
+        Write-Host "Сохранённый токен не читается (файл от другой учётной записи?)." -ForegroundColor Yellow
+        return ""
+    }
+}
+
+function Save-StoredToken([string]$value) {
+    if (-not $value) { return }
+    Add-Type -AssemblyName System.Security
+    $folder = Split-Path -Parent $TokenFile
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($value)
+    $protected = [Security.Cryptography.ProtectedData]::Protect($bytes, $null, "CurrentUser")
+    [IO.File]::WriteAllBytes($TokenFile, $protected)
+}
+
+function Remove-StoredToken {
+    if (Test-Path $TokenFile) { Remove-Item $TokenFile -Force }
+}
+
+if ($Forget) {
+    Remove-StoredToken
+    Write-Host "Сохранённый токен удалён: $TokenFile"
+    exit 0
+}
+
+if (-not $Token) { $Token = Get-StoredToken }
+
 if (-not $Token -and (Test-Gh)) {
     Write-Host "Publishing through GitHub CLI..."
     & gh release view $tag --repo $Repo 2>$null | Out-Null
@@ -97,6 +139,13 @@ if (-not $Token) {
     } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
     }
+    if ($Token) {
+        $answer = if ($SaveToken) { "y" } else { Read-Host "Сохранить токен на этой машине? [y/N]" }
+        if ($answer -match "^(y|Y|д|Д)$") {
+            Save-StoredToken $Token
+            Write-Host "Токен сохранён (DPAPI, только для вашей учётной записи): $TokenFile"
+        }
+    }
 }
 if (-not $Token) { throw "No GitHub token: nothing to publish with" }
 
@@ -106,6 +155,29 @@ $headers = @{
     "User-Agent"           = "Voice2Text-publisher"
     "X-GitHub-Api-Version" = "2022-11-28"
 }
+
+Write-Host "Checking repository $Repo..."
+try {
+    $repoInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo" -Headers $headers -Method Get
+} catch {
+    $code = $_.Exception.Response.StatusCode.value__
+    if ($code -eq 404) {
+        Write-Host "Репозиторий $Repo не найден или токену не выдан доступ к нему." -ForegroundColor Red
+        Write-Host "  - проверьте имя: release_github.cmd -Repo owner/name (сейчас $Repo)"
+        Write-Host "  - classic-токен: нужен scope repo"
+        Write-Host "  - fine-grained: выберите этот репозиторий и право Contents: Read and write"
+        Write-Host "  - если сохранён неверный токен: release_github.cmd -Forget"
+        exit 1
+    }
+    if ($code -eq 401) {
+        Write-Host "GitHub не принял токен (401). Удалите сохранённый: release_github.cmd -Forget" -ForegroundColor Red
+        exit 1
+    }
+    $detail = $_.ErrorDetails.Message
+    if ($detail) { Write-Host "GitHub: $detail" -ForegroundColor Red }
+    throw
+}
+Write-Host "Repository: $($repoInfo.full_name) ($($repoInfo.visibility))"
 
 Write-Host "Looking for release $tag..."
 $release = $null
