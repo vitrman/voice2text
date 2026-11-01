@@ -36,7 +36,13 @@ def main() -> int:
     root = ctk.CTk()
     root.withdraw()
     instance = app_module.App(root, app_module.Config({"hotkey_mode": "toggle"}))
-    instance._record_and_transcribe = lambda *args, **kwargs: time.sleep(5)
+
+    def slow_record(path, **kwargs):
+        time.sleep(5)
+        return path
+
+    instance.recorder.record_to_file = slow_record
+    instance.queue.submit = lambda *args, **kwargs: None
 
     instance.on_hotkey()
     time.sleep(0.1)

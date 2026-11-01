@@ -290,6 +290,16 @@ class GigaAMEngine:
     def _load(self) -> None:
         started = time.perf_counter()
         import gigaam  # тяжёлый импорт: torch подтягивается здесь
+        import torch
+
+        # одно ядро оставляем системе: иначе аудиопоток голодает, и в записи
+        # появляются дыры (см. recorder: переполнение буфера)
+        try:
+            cores = os.cpu_count() or 2
+            torch.set_num_threads(max(1, cores - 1))
+            self._log(f"torch: {torch.get_num_threads()} потоков из {cores}")
+        except Exception:
+            pass
 
         _patch_tokenizer()
         _patch_audio_loader()
@@ -325,13 +335,22 @@ class GigaAMEngine:
         self._log(f"модель {self._name} готова за {self.load_seconds:.1f} с")
 
     def transcribe(self, audio_int16, sample_rate: int = 16_000,
-                   chunk_seconds: float = 20.0) -> str:
+                   chunk_seconds: float = 20.0, cancel=None) -> str:
         """Распознаёт запись любой длины: режет по паузам, каждый кусок < 25 с."""
         self.load()
         parts = []
         for chunk in split_audio(audio_int16, sample_rate, chunk_seconds):
+            if cancel is not None and cancel.is_set():
+                from jobs import TranscriptionCancelled
+                raise TranscriptionCancelled("распознавание отменено")
             parts.append(self._transcribe_chunk(chunk, sample_rate))
         return " ".join(part for part in parts if part).strip()
+
+    def transcribe_file(self, path, chunk_seconds: float = 20.0, cancel=None) -> str:
+        """Распознать готовый WAV из очереди (наша запись: 16 кГц моно, 16 бит)."""
+        from recorder import read_wav_int16
+
+        return self.transcribe(read_wav_int16(path), 16_000, chunk_seconds, cancel=cancel)
 
     def _transcribe_chunk(self, audio_int16, sample_rate: int) -> str:
         path = WAV_DIR / f"{uuid.uuid4().hex}.wav"

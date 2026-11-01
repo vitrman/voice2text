@@ -6,6 +6,7 @@ import ctypes
 import datetime as dt
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -19,12 +20,20 @@ import customtkinter as ctk
 from asr_engine import GigaAMEngine
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
+import history
 import hotkey_capture
 from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
+from jobs import TranscriptionQueue
 from postprocess import apply_replacements, tidy
 from recorder import MicRecorder, RecorderError
 import update
 from version import VERSION
+import win32
+from win32 import (
+    HOOKPROC, INPUT, KBDLLHOOKSTRUCT, MSG, POINT,
+    KEYEVENTF_KEYUP, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+    VK_CONTROL, VK_V, WH_KEYBOARD_LL, WM_HOTKEY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+)
 
 from paths import DATA, ROOT
 
@@ -132,104 +141,13 @@ def trace_exc(message: str) -> None:
     trace(f"{message}: {traceback.format_exc().rstrip()}")
 
 
-USER32 = ctypes.windll.user32
-
-# 64-битные дескрипторы окон: без argtypes ctypes обрезает их до 32 бит и вызовы
-# молча ничего не делают (окно «показывается», но остаётся на месте)
-USER32.GetForegroundWindow.restype = ctypes.c_void_p
-USER32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-USER32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-USER32.GetAncestor.restype = ctypes.c_void_p
-USER32.IsWindow.argtypes = [ctypes.c_void_p]
-USER32.IsIconic.argtypes = [ctypes.c_void_p]
-USER32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
-USER32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-USER32.GetWindowThreadProcessId.restype = ctypes.c_ulong
-USER32.BringWindowToTop.argtypes = [ctypes.c_void_p]
-USER32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-USER32.GetWindowLongW.restype = ctypes.c_long
-USER32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
-USER32.SetWindowLongW.restype = ctypes.c_long
-USER32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
-                                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-USER32.SetWindowPos.restype = ctypes.c_bool
-USER32.IsWindowVisible.argtypes = [ctypes.c_void_p]
-USER32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
-                                      ctypes.c_size_t, ctypes.c_ssize_t]
-USER32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
-USER32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
-
-VK_CONTROL, VK_V = 0x11, 0x56
-KEYEVENTF_KEYUP = 0x0002
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
-                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [("uMsg", ctypes.c_ulong), ("wParamL", ctypes.c_ushort), ("wParamH", ctypes.c_ushort)]
-
-
-class _InputUnion(ctypes.Union):
-    # размер юниона должен быть как у MOUSEINPUT (32 байта), иначе SendInput
-    # отвергает весь массив с ERROR_INVALID_PARAMETER и ничего не вставляет
-    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [("type", ctypes.c_ulong), ("u", _InputUnion)]
-
-
-USER32.SendInput.restype = ctypes.c_uint
-USER32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
-
-WM_HOTKEY = 0x0312
-GWL_EXSTYLE = -20
-WS_EX_NOACTIVATE = 0x08000000
-WS_EX_TOOLWINDOW = 0x00000080
-SWP_NOACTIVATE = 0x0010
-SWP_SHOWWINDOW = 0x0040
-
-
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-
-class MSG(ctypes.Structure):
-    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint), ("wParam", ctypes.c_size_t),
-                ("lParam", ctypes.c_ssize_t), ("time", ctypes.c_ulong), ("pt", POINT)]
-
+USER32 = win32.user32
 
 HOTKEY_TID = {"tid": 0}
 WM_RELOAD_HOTKEYS = 0x8000 + 1
 WM_RETRY_HOTKEYS = 0x8000 + 2
 HOTKEY_RETRY_SECONDS = 60.0
 _RETRY_STARTED = {"done": False}
-
-WH_KEYBOARD_LL = 13
-
-
-USER32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-USER32.SetWindowsHookExW.restype = ctypes.c_void_p
-USER32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t]
-USER32.CallNextHookEx.restype = ctypes.c_ssize_t
-
-
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", ctypes.c_ulong), ("scanCode", ctypes.c_ulong),
-                ("flags", ctypes.c_ulong), ("time", ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.c_size_t)]
-
-
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t)
 
 
 def _hook_proc(n_code, w_param, l_param):
@@ -246,20 +164,11 @@ def _hook_proc(n_code, w_param, l_param):
 
 
 def start_keyboard_hook() -> None:
-    def run() -> None:
-        global HOOK_PROC
-        HOOK_PROC = HOOKPROC(_hook_proc)
-        handle = USER32.SetWindowsHookExW(WH_KEYBOARD_LL, HOOK_PROC, None, 0)
-        if not handle:
-            trace(f"hook: не установлен, ошибка {ctypes.windll.kernel32.GetLastError()}")
-            return
+    def ready() -> None:
         hotkey_capture.HOOK_READY["ok"] = True
-        trace("hook: клавиатурный хук установлен")
-        msg = MSG()
-        while USER32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            pass
 
-    threading.Thread(target=run, daemon=True).start()
+    win32.start_keyboard_hook(_hook_proc, log=trace, on_ready=ready)
+
 
 
 def apply_hotkey_specs(dictate: str, show: str) -> bool:
@@ -354,44 +263,6 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
     return thread
 
 
-def force_foreground(hwnd: int) -> bool:
-    USER32.BringWindowToTop(hwnd)
-    if USER32.SetForegroundWindow(hwnd):
-        return True
-    # обход блокировки смены фокуса: цепляемся к потоку текущего foreground-окна
-    foreground = USER32.GetForegroundWindow()
-    if not foreground:
-        return False
-    target_thread = USER32.GetWindowThreadProcessId(foreground, None)
-    current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
-    USER32.AttachThreadInput(current_thread, target_thread, True)
-    try:
-        return bool(USER32.SetForegroundWindow(hwnd))
-    finally:
-        USER32.AttachThreadInput(current_thread, target_thread, False)
-
-
-def send_ctrl_v() -> bool:
-    """Отправляет Ctrl+V в активное окно. False — если система заблокировала ввод."""
-    events = [INPUT(type=1, u=_InputUnion(ki=KEYBDINPUT(vk, 0, flags, 0, 0)))
-              for vk, flags in ((VK_CONTROL, 0), (VK_V, 0), (VK_V, KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP))]
-    array = (INPUT * len(events))(*events)
-    kernel32 = ctypes.windll.kernel32
-    kernel32.SetLastError(0)
-    sent = USER32.SendInput(len(events), array, ctypes.sizeof(INPUT))
-    if sent == len(events):
-        return True
-
-    error = kernel32.GetLastError()
-    trace(f"SendInput: {sent}/{len(events)}, ошибка {error}, sizeof(INPUT)={ctypes.sizeof(INPUT)}")
-    # 5 — UIPI (окно с большими правами), 87 — неверная структура, 0 — ввод перехвачен
-    USER32.keybd_event(VK_CONTROL, 0, 0, 0)
-    USER32.keybd_event(VK_V, 0, 0, 0)
-    USER32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-    USER32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-    return False
-
-
 class UpdateDialog(ctk.CTkToplevel):
     """Небольшое окно с прогрессом скачивания и кнопкой отмены."""
 
@@ -460,6 +331,14 @@ class App:
         self.quitting = False
         self.start_hidden = False
         self.tray_ready = False
+        self._last_take = None
+        self.queue = TranscriptionQueue(
+            transcribe=self._transcribe_file,
+            on_text=self._queue_text,
+            on_error=self._queue_error,
+            on_state=self._queue_state,
+            log=lambda message: trace(f"очередь: {message}"),
+        )
         self._capture = None          # активная запись комбинации в панели
         self._apply_after = None      # отложенное применение настроек
         self._applying = False
@@ -782,13 +661,7 @@ class App:
         self.entry_silence.pack(side="left", padx=(10, 0))
         self._bind_apply_on_leave(self.entry_silence)
 
-        self._panel_label("Максимум записи, с", top=6)
-        self.var_max = tk.IntVar(value=int(self.config["max_seconds"]))
-        entry_max = ctk.CTkEntry(panel, textvariable=self.var_max, width=90, corner_radius=10,
-                                 fg_color=BG, border_color=BORDER)
-        entry_max.pack(anchor="w", padx=16, pady=(0, 4))
-        self._bind_apply_on_leave(entry_max)
-        self._panel_hint("Без автостопа пишем до «Стоп» или этого лимита.")
+        self._panel_hint("Без автостопа пишем, пока не нажмёте «Стоп» (страховка — 30 минут).")
 
         self.var_minimized = tk.BooleanVar(value=bool(self.config["start_minimized"]))
         ctk.CTkCheckBox(panel, text="Запускать свёрнутым", variable=self.var_minimized,
@@ -959,14 +832,10 @@ class App:
                 return
         try:
             silence = max(200, int(self.var_silence.get()))
-            limit = max(10, int(self.var_max.get()))
             device_text = self.var_device.get()
             device = _device_from_label(device_text)
         except (ValueError, tk.TclError):
-            self.status.set("Проверьте числа: пауза и максимум записи")
-            return
-        if self.var_auto_stop.get() and silence >= limit * 1000:
-            self.status.set("Пауза больше максимальной длительности")
+            self.status.set("Проверьте числа: пауза перед остановкой")
             return
 
         values = {
@@ -977,7 +846,6 @@ class App:
             "hotkey_mode": "hold" if self.var_mode.get() == "удерживать" else "toggle",
             "silence_ms": silence,
             "auto_stop": bool(self.var_auto_stop.get()),
-            "max_seconds": limit,
             "autopaste": bool(self.autopaste.get()),
             "start_minimized": bool(self.var_minimized.get()),
             "replacements": _text_to_replacements(self.txt_replacements.get("1.0", "end-1c")),
@@ -997,7 +865,7 @@ class App:
                 self._refresh_record_button()
             if self.config["model"] != old_model:
                 # смена модели только в простое: иначе в памяти живут два чекпойнта
-                if self.busy:
+                if self._busy():
                     self._pending_model = self.config["model"]
                     self.status.set("Модель будет сменена после распознавания")
                 else:
@@ -1006,6 +874,10 @@ class App:
             self._applying = False
         if not self._pending_model:
             self.status.set("Настройки сохранены")
+
+    def _busy(self) -> bool:
+        """Занято, если идёт запись или в очереди есть нераспознанные фразы."""
+        return self.recording or self.queue.depth > 0
 
     def _switch_model(self, name: str) -> None:
         old = self.engine
@@ -1066,36 +938,109 @@ class App:
                          highlightbackground=BORDER)
         frame.pack(fill="both", expand=True)
         self.overlay_dot = tk.Label(frame, text="●", font=("Segoe UI", 17), bg=CARD, fg=RECORD)
-        self.overlay_dot.pack(side="left", padx=(16, 10), pady=10)
+        self.overlay_dot.pack(side="left", padx=(16, 8), pady=10)
+        self.overlay_time = tk.Label(frame, text="", font=("Segoe UI", 13, "bold"),
+                                     bg=CARD, fg=TEXT)
+        self.overlay_time.pack(side="left", padx=(0, 8))
         self.overlay_text = tk.Label(frame, text="", font=("Segoe UI", 12), bg=CARD, fg=TEXT)
-        self.overlay_text.pack(side="left", padx=(0, 18), pady=10)
+        self.overlay_text.pack(side="left", padx=(0, 12))
+        # уровень громкости: видно, что микрофон действительно слышит
+        self.overlay_canvas = tk.Canvas(frame, width=90, height=8, bg=CARD_HOVER,
+                                        highlightthickness=0)
+        self.overlay_canvas.pack(side="left", padx=(0, 16))
+        self.overlay_bar = self.overlay_canvas.create_rectangle(0, 0, 0, 8, fill=ACCENT, width=0)
 
         self.overlay_after = None
-        for widget in (self.overlay, frame, self.overlay_text, self.overlay_dot):
+        self._overlay_phase = None        # None — обычное сообщение с TTL
+        self._overlay_started = 0.0
+        self._overlay_dots = 0
+        for widget in (self.overlay, frame, self.overlay_text, self.overlay_dot,
+                       self.overlay_time, self.overlay_canvas):
             widget.bind("<Button-1>", lambda _e: self._show_window())
 
         self.overlay.update_idletasks()
         hwnd = USER32.GetAncestor(self.overlay.winfo_id(), 2) or self.overlay.winfo_id()
-        style = USER32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        USER32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        win32.make_overlay(hwnd)
         self.overlay_hwnd = hwnd
 
-    def _overlay_show(self, text: str, color: str = "#e05555", ttl_ms: int = 1500) -> None:
-        if self.overlay is None:
-            return
-        self.overlay_text.configure(text=text)
-        self.overlay_dot.configure(fg=color)
+    def _overlay_place(self) -> None:
         self.overlay.update_idletasks()
-        width = max(self.overlay.winfo_reqwidth(), 220)
+        width = max(self.overlay.winfo_reqwidth(), 260)
         height = self.overlay.winfo_reqheight()
         x = (self.overlay.winfo_screenwidth() - width) // 2
         y = self.overlay.winfo_screenheight() - height - 96
         # geometry у overrideredirect-окна применяется ненадёжно — ставим через WinAPI
-        USER32.SetWindowPos(self.overlay_hwnd, -1, x, y, width, height,
-                            SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        win32.place_window(self.overlay_hwnd, x, y, width, height)
+
+    def _overlay_show(self, text: str, color: str = "#e05555", ttl_ms: int = 1500) -> None:
+        """Короткое сообщение: «Вставлено», «Скопировано в буфер», ошибка."""
+        if self.overlay is None:
+            return
+        self._overlay_phase = None
+        self.overlay_time.configure(text="")
+        self.overlay_text.configure(text=text)
+        self.overlay_dot.configure(fg=color)
+        self._overlay_place()
         if self.overlay_after is not None:
             self.root.after_cancel(self.overlay_after)
         self.overlay_after = self.root.after(ttl_ms, self._overlay_hide)
+
+    def _overlay_recording(self) -> None:
+        """Живой индикатор записи: таймер, фаза и уровень, без исчезновения по TTL."""
+        if self.overlay is None:
+            return
+        self._overlay_phase = "recording"
+        self._overlay_started = time.monotonic()
+        self.overlay_dot.configure(fg=RECORD)
+        self.overlay_time.configure(text="0:00")
+        self.overlay_text.configure(text="говорите…")
+        self._overlay_level(0)
+        self._overlay_place()
+        if self.overlay_after is not None:
+            self.root.after_cancel(self.overlay_after)
+            self.overlay_after = None
+        self._overlay_tick()
+
+    def _overlay_processing(self, depth: int = 0) -> None:
+        """Фаза распознавания: видно, что запись принята и сколько ещё в очереди."""
+        if self.overlay is None:
+            return
+        self._overlay_phase = "processing"
+        self.overlay_dot.configure(fg="#e0a33a")
+        self.overlay_time.configure(text="")
+        self.overlay_dots = 0
+        tail = f" (в очереди {depth})" if depth > 0 else ""
+        self.overlay_text.configure(text=f"Распознаю{tail}")
+        self._overlay_level(0)
+        self._overlay_place()
+        self._overlay_tick()
+
+    def _overlay_tick(self) -> None:
+        if self._overlay_phase is None:
+            return
+        if self._overlay_phase == "recording":
+            seconds = int(time.monotonic() - self._overlay_started)
+            self.overlay_time.configure(text=f"{seconds // 60}:{seconds % 60:02d}")
+        else:
+            self._overlay_dots = (self._overlay_dots + 1) % 4
+            tail = "" if self._overlay_dots == 0 else "." * self._overlay_dots
+            base = "Распознаю"
+            self.overlay_text.configure(text=f"{base}{tail}")
+        self.overlay_after = self.root.after(250, self._overlay_tick)
+
+    def _overlay_level(self, percent: float) -> None:
+        if self.overlay is None:
+            return
+        width = int(90 * max(0.0, min(100.0, percent)) / 100)
+        self.overlay_canvas.coords(self.overlay_bar, 0, 0, width, 8)
+
+    def _overlay_stop(self) -> None:
+        """Снимает живую фазу; сообщения с TTL продолжают работать как раньше."""
+        self._overlay_phase = None
+        if self.overlay_after is not None:
+            self.root.after_cancel(self.overlay_after)
+            self.overlay_after = None
+        self._overlay_level(0)
 
     def _overlay_hide(self) -> None:
         self.overlay_after = None
@@ -1117,6 +1062,10 @@ class App:
 
     def _quit(self) -> None:
         self.quitting = True
+        try:
+            self.queue.stop()
+        except Exception:
+            pass
         if self.icon is not None:
             try:
                 self.icon.stop()
@@ -1131,6 +1080,9 @@ class App:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Повторить последнюю запись", command=self.retry_last)
+        file_menu.add_command(label="Отменить распознавание", command=self.cancel_recognition)
+        file_menu.add_separator()
         file_menu.add_command(label="Свернуть", command=self.hide_to_tray)
         file_menu.add_command(label="Выход", command=self._quit)
         menubar.add_cascade(label="Файл", menu=file_menu)
@@ -1140,10 +1092,19 @@ class App:
         help_menu.add_separator()
         help_menu.add_command(label="Диагностика", command=self.run_diagnostics)
         help_menu.add_command(label="Открыть журнал", command=self.open_log)
+        help_menu.add_command(label="Открыть историю", command=self.open_history)
         help_menu.add_command(label="Открыть папку данных", command=self.open_data_folder)
         help_menu.add_command(label="О программе", command=self.show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
         self.root.config(menu=menubar)
+
+    def open_history(self) -> None:
+        try:
+            history.HISTORY.parent.mkdir(parents=True, exist_ok=True)
+            history.HISTORY.touch(exist_ok=True)
+            os.startfile(str(history.HISTORY))  # noqa: S606
+        except OSError as exc:
+            self.status.set(f"Не удалось открыть историю: {exc}")
 
     def open_log(self) -> None:
         try:
@@ -1279,20 +1240,7 @@ class App:
             trace("кнопка: стоп")
             self.stop_event.set()
             return
-        if self.ptt_active and self.stop_event is not None:
-            self.stop_event.set()
-            return
-        if self.busy:
-            return
-        if not self.recording:
-            self.stop_event = threading.Event()   # без него кнопка «Стоп» не останавливает
-            self._remember_target()
-            self.recording = True
-            self.busy = True
-            self._set_record_state(True)
-            self.status.set("Слушаю…")
-            self.events.put(("overlay", ("Запись…", "#e05555", 15000)))
-            threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+        self._start_recording(push_to_talk=False, source="кнопка")
 
     def _remember_target(self) -> None:
         # цель вставки — окно, активное в момент старта записи
@@ -1323,16 +1271,7 @@ class App:
             trace("hotkey: повторное нажатие, стоп")
             self.stop_event.set()
             return
-        if self.busy:
-            return
-        self._remember_target()
-        self.stop_event = threading.Event()
-        self.recording = True
-        self.busy = True
-        self._set_record_state(True)
-        self.status.set("Слушаю… нажмите хоткей ещё раз, чтобы остановить")
-        self.events.put(("overlay", ("Запись… ещё раз — стоп", "#e05555", 25000)))
-        threading.Thread(target=self._record_and_transcribe, args=(False,), daemon=True).start()
+        self._start_recording(push_to_talk=False, source="хоткей")
 
     def start_push_to_talk(self) -> None:
         """Хоткей: пишем, пока клавиши зажаты; повторное нажатие — стоп."""
@@ -1342,23 +1281,109 @@ class App:
             trace("ptt: повторное нажатие — останавливаю")
             self.stop_event.set()
             return
-        if self.busy:
-            trace("ptt: занято, пропускаю")
-            return
-        self.ptt_active = True
-        self._remember_target()
-        self.stop_event = threading.Event()
-        self.recording = True
-        self.busy = True
-        self._set_record_state(True)
-        self.status.set("Слушаю… отпустите клавиши или нажмите хоткей ещё раз")
-        self.events.put(("overlay", ("Запись… отпустите клавиши или нажмите хоткей ещё раз",
-                                     "#e05555", 25000)))
-        threading.Thread(target=self._record_and_transcribe, args=(True,), daemon=True).start()
+        self._start_recording(push_to_talk=True, source="хоткей")
         # опрос всегда: хук не видит клавиши, если активное окно запущено от админа
         threading.Thread(target=self._watch_release, args=(self.stop_event,), daemon=True).start()
 
-    def _watch_release(self, event: threading.Event) -> None:
+    def _start_recording(self, push_to_talk: bool, source: str) -> None:
+        """Старт записи. Распознавание предыдущей фразы не мешает — оно в очереди."""
+        if self.recording:
+            return
+        if not self._disk_ready():
+            return
+        self._remember_target()
+        self.stop_event = threading.Event()
+        self.recording = True
+        self.ptt_active = push_to_talk
+        self._set_record_state(True)
+        self._overlay_recording()
+        hint = ("Слушаю… отпустите клавиши или нажмите хоткей ещё раз" if push_to_talk
+                else "Слушаю… нажмите хоткей ещё раз, чтобы остановить")
+        self.status.set(hint + self._queue_suffix())
+        path = history.take_path()
+        self._last_take = path
+        trace(f"запись ({source}): {path}")
+        threading.Thread(target=self._capture, args=(path, push_to_talk), daemon=True).start()
+
+    def _queue_suffix(self) -> str:
+        depth = self.queue.depth
+        return f" · в очереди {depth}" if depth else ""
+
+    def _disk_ready(self) -> bool:
+        """Очередь записей не должна забить диск: при нехватке места не начинаем."""
+        try:
+            free = shutil.disk_usage(str(DATA)).free
+        except OSError:
+            return True
+        if free < 200 * 2 ** 20:
+            self.status.set("Мало места на диске — освободите хотя бы 200 МБ")
+            self._overlay_show("Мало места на диске", "#e05555", 2500)
+            return False
+        return True
+
+    def _capture(self, path, push_to_talk: bool) -> None:
+        """Пишет реплику в файл и ставит её в очередь распознавания."""
+        try:
+            self.recorder.record_to_file(
+                path,
+                silence_ms=int(self.config["silence_ms"])
+                if self.config.get("auto_stop", True) else 0,
+                on_level=self._level_cb,
+                push_to_talk=push_to_talk,
+                stop_event=self.stop_event,
+            )
+            lost = self.recorder.last_overflow_ms
+            if lost >= 500:
+                self.events.put(("status", f"Потеряно {lost} мс звука — проверьте текст"))
+            self.events.put(("captured", path))
+            self.queue.submit(path, self.paste_target)
+            self.events.put(("queue_state", self.queue.depth))
+        except RecorderError as exc:
+            trace(f"запись не удалась: {exc}")
+            self.events.put(("status", str(exc)))
+            self.events.put(("overlay", (str(exc)[:60], "#e05555", 2500)))
+        except Exception as exc:
+            trace_exc("recording error")
+            self.events.put(("status", f"Ошибка записи: {exc}"))
+        finally:
+            self.recording = False
+            self.ptt_active = False
+            self.events.put(("reset_button", None))
+
+    def _transcribe_file(self, path, cancel) -> str:
+        """Вызывается из рабочего потока очереди: без интерфейса и без Tk."""
+        text = self.engine.transcribe_file(path,
+                                          chunk_seconds=float(self.config["chunk_seconds"]),
+                                          cancel=cancel)
+        return tidy(apply_replacements(text, self.config.get("replacements") or {}))
+
+    def _queue_text(self, text: str, task: dict) -> None:
+        self.events.put(("text", (text, task.get("target"))))
+
+    def _queue_error(self, exc: Exception, task: dict) -> None:
+        trace_exc(f"transcribe error ({type(exc).__name__})")
+        self.events.put(("take_error", (str(exc), task.get("path"))))
+
+    def _queue_state(self, depth: int) -> None:
+        self.events.put(("queue_state", depth))
+
+    def retry_last(self) -> None:
+        """Повторить распознавание последней записи — микрофон не нужен."""
+        path = self._last_take
+        if path is None or not path.exists():
+            self.status.set("Нет записи для повтора")
+            return
+        self.queue.submit(path, self.paste_target)
+        self.status.set("Повторное распознавание…")
+
+    def cancel_recognition(self) -> None:
+        """Снимает очередь и прерывает текущую фразу."""
+        dropped = self.queue.cancel_all()
+        self._overlay_stop()
+        self._overlay_show("Распознавание отменено", "#e0a33a", 2000)
+        self.status.set(f"Распознавание отменено (снято задач: {dropped})")
+
+    def _watch_release(self, event) -> None:
         """Стоп по отпусканию клавиш фактической комбинации.
 
         Хук для этого не используется: он не получает нажатий, когда активное окно
@@ -1379,49 +1404,13 @@ class App:
                 seen_held = True
             elif seen_held or time.monotonic() - started > 0.3:
                 break
-            if time.monotonic() - started > 1800:      # страховка от забытой записи
+            if time.monotonic() - started > 1900:      # страховка от забытой записи
                 break
             time.sleep(0.025)
         self.ptt_active = False
         if not event.is_set():
             trace("ptt: клавиши отпущены, стоп")
             event.set()
-
-    def _record_and_transcribe(self, push_to_talk: bool = False) -> None:
-        try:
-            audio = self.recorder.record(
-                max_seconds=float(self.config["max_seconds"]),
-                silence_ms=int(self.config["silence_ms"])
-                if self.config.get("auto_stop", True) else 0,
-                on_level=self._level_cb,
-                push_to_talk=push_to_talk,
-                stop_event=self.stop_event,
-            )
-            trace(f"record done: {len(audio)} сэмплов, dtype={audio.dtype}")
-            self.events.put(("status", "Распознаю…"))
-            self.events.put(("overlay", ("Распознаю…", "#e0a33a", 15000)))
-            text = self.engine.transcribe(audio, chunk_seconds=float(self.config["chunk_seconds"]))
-            text = tidy(apply_replacements(text, self.config.get("replacements") or {}))
-            trace(f"transcribe done: {len(text)} символов")
-            self.events.put(("text", text))
-            if not text:
-                self.events.put(("status", "Речь не распознана — тишина или шум"))
-                self.events.put(("overlay", ("Ничего не распознано", "#e0a33a", 2000)))
-        except RecorderError as exc:
-            trace_exc("recorder error")
-            self.events.put(("status", str(exc)))
-            self.events.put(("overlay", (str(exc)[:60], "#e05555", 2500)))
-        except Exception as exc:
-            # трассировка обязательна: по одному сообщению WinError причина не видна
-            trace_exc(f"transcribe error ({type(exc).__name__})")
-            self.events.put(("status", f"Ошибка распознавания: {exc}"))
-            self.events.put(("error", f"Не удалось распознать:\n{exc}\n\nПодробности — в журнале:\n{LOG}"))
-        finally:
-            self.recording = False
-            self.busy = False
-            self.ptt_active = False
-            self.events.put(("reset_button", None))
-            self.events.put(("idle", None))
 
     def _level_cb(self, db: float, voiced: bool) -> None:
         # -60..0 дБ -> 0..100
@@ -1436,12 +1425,24 @@ class App:
                     self.status.set(payload)
                     trace(f"status: {payload}")
                 elif kind == "text":
-                    if payload:
-                        self._append(payload)
+                    text, target = payload if isinstance(payload, tuple) else (payload, None)
+                    if text:
+                        self._append(text, target)
                     else:
                         trace("text: пустая строка от модели")
+                        self.status.set("Речь не распознана — тишина или шум")
+                        self._overlay_show("Ничего не распознано", "#e0a33a", 2000)
+                elif kind == "captured":
+                    self._overlay_processing(self.queue.depth + 1)
+                elif kind == "queue_state":
+                    self._on_queue_state(payload)
+                elif kind == "take_error":
+                    self._on_take_error(*payload)
                 elif kind == "level":
-                    self.level.set(max(0.0, min(1.0, payload / 100.0)))
+                    percent = max(0.0, min(100.0, payload))
+                    self.level.set(percent / 100.0)
+                    if self.recording:
+                        self._overlay_level(percent)
                 elif kind == "error":
                     messagebox.showerror("Голосовой ввод", payload)
                 elif kind == "hotkey":
@@ -1493,6 +1494,8 @@ class App:
                 elif kind == "reset_button":
                     self._set_record_state(False)
                     self.level.set(0)
+                    if not self.recording:
+                        self._overlay_level(0)
                 elif kind == "idle":
                     self._apply_pending_model()
         except queue.Empty:
@@ -1504,13 +1507,39 @@ class App:
         finally:
             self.root.after(80, self._drain_events)
 
-    def _append(self, text: str) -> None:
+    def _on_queue_state(self, depth: int) -> None:
+        """Очередь сообщает, сколько фраз ещё ждут распознавания."""
+        if depth:
+            if not self.recording:
+                self._overlay_processing(depth)
+            self.status.set(f"Распознаю… (в очереди {depth})")
+            return
+        if not self.recording:
+            self._overlay_stop()
+        self._apply_pending_model()
+
+    def _on_take_error(self, message: str, path) -> None:
+        """Ошибка распознавания не должна стоить пользователю сказанной фразы."""
+        self.status.set(f"Ошибка распознавания: {message}")
+        self._overlay_stop()
+        retry = messagebox.askyesno(
+            "Голосовой ввод",
+            f"Не удалось распознать запись:\n{message}\n\n"
+            f"Запись сохранена, её можно повторить.\n"
+            f"Подробности — в журнале:\n{LOG}",
+            parent=self.root)
+        if retry and path:
+            self.queue.submit(path, self.paste_target)
+            self.status.set("Повторное распознавание…")
+
+    def _append(self, text: str, target=None) -> None:
         prefix = "" if self.text.index("end-1c") == "1.0" else "\n"
         self.text.insert("end", prefix + text)
         self.text.see("end")
-        self._deliver(text)
+        history.append_text(text)
+        self._deliver(text, target)
 
-    def _deliver(self, text: str) -> None:
+    def _deliver(self, text: str, target=None) -> None:
         """Кладём в буфер и, если включено, вставляем в окно, активное до записи."""
         if not set_clipboard_text(text):
             self.root.clipboard_clear()
@@ -1521,7 +1550,7 @@ class App:
             self.status.set("Текст в буфере обмена — вставьте Ctrl+V")
             self.events.put(("overlay", ("Скопировано в буфер", "#4caf50", 1500)))
             return
-        target = self.paste_target
+        target = target or self.paste_target
         current = USER32.GetForegroundWindow()
         # переключились, пока говорили — вставляем туда, где пользователь сейчас
         if current and USER32.IsWindow(current) and not self._is_own(current) and current != target:
@@ -1551,28 +1580,24 @@ class App:
             self.status.set("Фокус ушёл из окна вставки — текст в буфере обмена")
             self.events.put(("overlay", ("Фокус ушёл — текст в буфере", "#e0a33a", 2000)))
             return
-        injected = send_ctrl_v()
+        injected = win32.send_ctrl_v(log=trace)
         trace(f"paste target={target} injected={injected}")
         if injected:
-            self.status.set("Вставлено в активное окно")
-            self.events.put(("overlay", ("Вставлено", "#4caf50", 1200)))
+            title = win32.window_title(target).strip()
+            short = (title[:28] + "…") if len(title) > 28 else title
+            self.status.set(f"Вставлено в «{short}»" if short else "Вставлено в активное окно")
+            self.events.put(("overlay", (f"Вставлено в {short}" if short else "Вставлено",
+                                         "#4caf50", 1500)))
         else:
             self.status.set("Система не дала вставить — текст в буфере обмена (Ctrl+V)")
             self.events.put(("overlay", ("Вставка заблокирована — текст в буфере", "#e05555", 2500)))
 
     def _window_title(self, hwnd: int) -> str:
-        buffer = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buffer, 256)
-        return buffer.value
+        return win32.window_title(hwnd)
 
     def _focus_window(self, target: int, attempts: int = 3) -> bool:
         """Переключаем фокус и проверяем, что он действительно у цели."""
-        for _ in range(attempts):
-            if USER32.GetForegroundWindow() == target:
-                return True
-            force_foreground(target)
-            time.sleep(0.12)
-        return USER32.GetForegroundWindow() == target
+        return win32.focus_window(target, attempts)
 
     def copy_text(self) -> None:
         content = self.text.get("1.0", "end-1c")
@@ -1606,64 +1631,6 @@ class App:
             self.root.destroy()
 
 
-SINGLE_INSTANCE_HANDLE = None
-SHOW_EVENT = {"handle": None, "callback": None}
-SHOW_EVENT_NAME = "Local\\voice2text-show"
-EVENT_MODIFY_STATE = 0x0002
-WAIT_INFINITE = 0xFFFFFFFF
-
-
-def already_running() -> bool:
-    """Один экземпляр: иначе два окна делят хоткей, лог и файлы модели."""
-    if os.environ.get("V2T_ALLOW_MULTI") == "1":
-        return False
-    global SINGLE_INSTANCE_HANDLE
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateEventW.restype = ctypes.c_void_p
-    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.OpenEventW.restype = ctypes.c_void_p
-    kernel32.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.SetEvent.argtypes = [ctypes.c_void_p]
-    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    SINGLE_INSTANCE_HANDLE = kernel32.CreateMutexW(None, False, "Local\\voice2text-single")
-    return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
-
-
-def start_show_listener(callback) -> None:
-    """Первый экземпляр слушает событие: второй запуск просто просит показать окно."""
-    kernel32 = ctypes.windll.kernel32
-    SHOW_EVENT["callback"] = callback
-    SHOW_EVENT["handle"] = kernel32.CreateEventW(None, False, False, SHOW_EVENT_NAME)
-
-    def wait() -> None:
-        handle = SHOW_EVENT["handle"]
-        if not handle:
-            return
-        while True:
-            if kernel32.WaitForSingleObject(handle, WAIT_INFINITE) != 0:
-                return
-            if SHOW_EVENT["callback"] is not None:
-                SHOW_EVENT["callback"]()
-
-    threading.Thread(target=wait, daemon=True).start()
-
-
-def request_show() -> bool:
-    """Второй экземпляр просит первый показать окно. False — если он старый."""
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SHOW_EVENT_NAME)
-    if not handle:
-        return False
-    try:
-        kernel32.SetEvent(handle)
-    finally:
-        kernel32.CloseHandle(handle)
-    return True
-
-
 def main() -> None:
     try:
         _main()
@@ -1689,9 +1656,9 @@ def _main() -> None:
     except OSError:
         pass  # маркер нужен только для диагностики, падать из-за него нельзя
     root = ctk.CTk()
-    if already_running():
+    if win32.already_running(os.environ.get("V2T_ALLOW_MULTI") == "1"):
         # второй запуск просто поднимает окно первого, без окон-тупиков
-        if not request_show():
+        if not win32.request_show():
             root.withdraw()
             messagebox.showinfo("Голосовой ввод",
                                 "Приложение уже запущено — ищите иконку в трее.")
@@ -1699,7 +1666,7 @@ def _main() -> None:
         return
     config = Config.load(on_error=trace)
     app = App(root, config)
-    start_show_listener(lambda: app.events.put(("show", None)))
+    win32.start_show_listener(lambda: app.events.put(("show", None)))
     # окно сворачивается только когда иконка трея реально создалась (см. tray_ready)
     app.start_hidden = bool(config["start_minimized"]) and "--show" not in sys.argv
     root.mainloop()

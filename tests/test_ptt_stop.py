@@ -65,11 +65,12 @@ def main() -> int:
     root.withdraw()
     instance = app_module.App(root, app_module.Config({"hotkey_mode": "hold"}))
 
-    def slow_record(**kwargs):
+    def slow_record(path, **kwargs):
         time.sleep(1.0)
-        return np.zeros(16000, np.int16)
+        return path
 
-    instance.recorder.record = slow_record
+    instance.recorder.record_to_file = slow_record
+    instance.queue.submit = lambda *args, **kwargs: None
 
     fake = FakeUser32(app_module.USER32)
     app_module.USER32 = fake

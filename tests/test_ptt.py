@@ -20,17 +20,16 @@ from test_vad import read_sample  # noqa: E402
 class RealTimeStream:
     """Отдаёт аудио с той же скоростью, что и микрофон."""
 
-    def __init__(self, audio: np.ndarray, block: int, block_ms: int):
+    def __init__(self, audio: np.ndarray, block: int):
         self.audio = audio
         self.pos = 0
         self.block = block
-        self.block_ms = block_ms
 
     def start(self):
         pass
 
     def read(self, frames):
-        time.sleep(self.block_ms / 1000)
+        time.sleep(frames / 16000)          # ровно столько же, сколько длится звук
         chunk = self.audio[self.pos:self.pos + frames]
         self.pos += frames
         if len(chunk) < frames:
@@ -47,9 +46,9 @@ class RealTimeStream:
 def main() -> int:
     speech = read_sample()
     stream_audio = np.concatenate([speech, np.zeros(16000 * 5, np.float32)])
-    block_ms = 30
+    block_ms = recorder.BLOCK_MS
     recorder.sd.InputStream = lambda **kwargs: RealTimeStream(
-        stream_audio, int(16000 * block_ms / 1000), block_ms)
+        stream_audio, int(16000 * block_ms / 1000))
 
     stop = threading.Event()
     threading.Timer(2.0, stop.set).start()
