@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import faulthandler
 import os
 import queue
 import shutil
@@ -1744,6 +1745,26 @@ class App:
             self.root.destroy()
 
 
+NATIVE_LOG = None
+
+
+def _enable_native_log() -> None:
+    """Стеки при аварийном падении процесса (например, в драйвере звука).
+
+    Без этого «программа зависла и закрылась» не оставляет вообще никаких следов:
+    Python-исключение тут не возникает, процесс убивает сам себя на уровне ОС.
+    """
+    global NATIVE_LOG
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        NATIVE_LOG = open(DATA / ".cache" / "native.log", "a", encoding="utf-8")
+        NATIVE_LOG.write(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        NATIVE_LOG.flush()
+        faulthandler.enable(file=NATIVE_LOG, all_threads=True)
+    except Exception:
+        NATIVE_LOG = None
+
+
 def main() -> None:
     try:
         _main()
@@ -1758,6 +1779,7 @@ def main() -> None:
 
 
 def _main() -> None:
+    _enable_native_log()
     if "--uninstall" in sys.argv:
         from uninstall import run_uninstall
         sys.exit(run_uninstall())

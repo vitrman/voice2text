@@ -193,6 +193,36 @@ def open_input_stream(device_spec=None, block_ms: int = BLOCK_MS, log=print,
     raise RecorderError(f"Не удалось открыть микрофон: {last_error}")
 
 
+def _shutdown_stream(stream, reader, reader_stop, timeout: float = 2.0, log=print) -> None:
+    """Останавливает поток так, чтобы не дёргать handle, пока насос читает.
+
+    PortAudio нельзя закрывать, пока другой поток находится внутри Pa_ReadStream:
+    это гонка, которая валит процесс без записи в журнал (наблюдали «запись
+    зависла, потом приложение закрылось»). Сначала abort() — он будит заблокированный
+    read(), ждём выхода насоса и только потом close().
+    """
+    reader_stop.set()
+    abort = getattr(stream, "abort", None)
+    if callable(abort):
+        try:
+            abort()
+        except Exception:
+            pass
+    else:
+        try:
+            stream.stop()
+        except Exception:
+            pass
+    reader.join(timeout)
+    if reader.is_alive():
+        log("микрофон: поток чтения не завершился, поток оставляю открытым")
+        return
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 class MicRecorder:
     """Пишет одну реплику в WAV. Ограничения длины нет, кроме страховки 30 минут."""
 
@@ -368,14 +398,8 @@ class MicRecorder:
             else:
                 limited = True
         finally:
-            reader_stop.set()
+            _shutdown_stream(stream, reader, reader_stop, log=self.log)
             writer.close()
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
-            reader.join(timeout=0.5)
 
         self.last_overflow_ms = lost_blocks * self.block_ms
         if self.last_overflow_ms:
@@ -422,7 +446,8 @@ class MicRecorder:
                 except queue.Full:
                     pass
 
-        threading.Thread(target=pump, daemon=True).start()
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
         last_data = time.monotonic()
         try:
             while len(collected) < limit_blocks:
@@ -444,12 +469,7 @@ class MicRecorder:
                 if silence_ms > 0 and len(collected) * self.block_ms > silence_ms:
                     break
         finally:
-            reader_stop.set()
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
+            _shutdown_stream(stream, reader, reader_stop, log=self.log)
         if not collected:
             raise RecorderError("Речь не обнаружена")
         audio = _resample(np.concatenate(collected), real_sr)

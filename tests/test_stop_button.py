@@ -196,6 +196,60 @@ def run_stop_while_open() -> int:
     return 1
 
 
+def run_shutdown_order() -> int:
+    """Поток нельзя закрывать, пока насос внутри read: это валило процесс.
+
+    Порядок обязан быть: abort() -> дождаться выхода насоса -> close().
+    """
+    class AbortableStream:
+        def __init__(self):
+            self.aborted = threading.Event()
+            self.state = {"reading": 0, "closed": False, "abort": False, "close_while_reading": False}
+
+        def start(self):
+            pass
+
+        def read(self, frames):
+            self.state["reading"] += 1
+            try:
+                self.aborted.wait()
+                raise OSError("aborted")
+            finally:
+                self.state["reading"] -= 1
+
+        def abort(self):
+            self.state["abort"] = True
+            self.aborted.set()
+
+        def stop(self):
+            self.aborted.set()
+
+        def close(self):
+            if self.state["reading"]:
+                self.state["close_while_reading"] = True
+            self.state["closed"] = True
+
+    stream = AbortableStream()
+    recorder.sd.InputStream = lambda **kwargs: stream
+    mic = recorder.MicRecorder(block_ms=50, log=lambda _: None)
+    stop = threading.Event()
+    threading.Timer(0.4, stop.set).start()
+    path = Path(tempfile.gettempdir()) / "shutdown-test.wav"
+    started = time.perf_counter()
+    try:
+        mic.record_to_file(path, silence_ms=0, start_timeout=8, stop_event=stop)
+    except recorder.RecorderError:
+        pass
+    elapsed = time.perf_counter() - started
+    path.unlink(missing_ok=True)
+    print(f"закрытие потока: abort={stream.state['abort']}, "
+          f"close={stream.state['closed']}, закрыли во время чтения="
+          f"{stream.state['close_while_reading']}, вышли за {elapsed:.1f} с")
+    ok = (stream.state["abort"] and stream.state["closed"]
+          and not stream.state["close_while_reading"] and elapsed < 3.0)
+    return 0 if ok else 1
+
+
 def main() -> int:
     for silence_ms in (0, 700):
         seconds = run(silence_ms)
@@ -210,7 +264,9 @@ def main() -> int:
         return 1
     if run_stop_while_open():
         return 1
-    print("остановка и таймауты устройства: ок")
+    if run_shutdown_order():
+        return 1
+    print("остановка, таймауты и порядок закрытия: ок")
     return 0
 
 
