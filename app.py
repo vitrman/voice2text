@@ -26,7 +26,7 @@ import hotkey_capture
 from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
 from jobs import TranscriptionQueue
 from postprocess import apply_replacements, tidy
-from recorder import MicRecorder, RecorderError
+from recorder import MicRecorder, RecorderError, RecordingStopped
 from theme import (ACCENT, ACCENT_HOVER, BG, BORDER, CARD, CARD_HOVER, MUTED,
                    RECORD, RECORD_HOVER, TEXT)
 import update
@@ -310,7 +310,8 @@ class App:
         self.config = config or Config()
         self.engine = GigaAMEngine(model_name=self.config["model"], log=self.log,
                                   on_progress=self._model_progress)
-        self.recorder = MicRecorder(log=self.log, device=self.config.get("device"))
+        self.recorder = MicRecorder(log=lambda message: trace(f"микрофон: {message}"),
+                                    device=self.config.get("device"))
         self.events: queue.Queue = queue.Queue()
         self.busy = False
         self.recording = False
@@ -331,7 +332,10 @@ class App:
             on_state=self._queue_state,
             log=lambda message: trace(f"очередь: {message}"),
         )
-        self._capture = None          # активная запись комбинации в панели
+        # состояние записи комбинации: раньше называлось self._capture и перекрывало
+        # одноимённый метод записи — поток стартовал с target=None и молча падал
+        self._hotkey_state = None
+        self._record_thread = None    # поток текущей записи: нужен для диагностики
         self._apply_after = None      # отложенное применение настроек
         self._applying = False
         self._update_busy = False     # проверка/скачивание уже идёт
@@ -343,6 +347,7 @@ class App:
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self._log_environment()
+        self._migrate_device()
         threading.Thread(target=self._cleanup_cache, daemon=True).start()
         self.root.report_callback_exception = self._ui_exception
         self._build_ui()
@@ -364,6 +369,33 @@ class App:
             self.root.after(700, self._maybe_first_run)
         if self.config.get("check_updates", True):
             self.root.after(15000, self._auto_update_check)
+
+    def _migrate_device(self) -> None:
+        """Старый конфиг хранил номер устройства — переводим в имя и проверяем его.
+
+        Номер мог съехать после подключения гарнитуры: тогда приложение открывало
+        чужой или несуществующий вход и запись молча висела.
+        """
+        spec = self.config.get("device")
+        if not isinstance(spec, int):
+            return
+        try:
+            from recorder import input_device_items
+            items = input_device_items()
+        except Exception:
+            items = []
+        for item in items:
+            if item["index"] == spec:
+                self.config["device"] = {"name": item["name"], "hostapi": item["hostapi"]}
+                trace(f"микрофон: номер {spec} -> {item['name']}")
+                break
+        else:
+            self.config["device"] = None
+            trace(f"микрофон: номер {spec} больше не существует, выбран по умолчанию")
+        try:
+            self.config.save()
+        except OSError:
+            pass
 
     def _warn_missing_device(self) -> None:
         """Микрофон мог исчезнуть: молча писать тишину хуже, чем сказать об этом."""
@@ -802,7 +834,7 @@ class App:
 
     # ---------- запись комбинации в панели ----------
     def _start_capture(self, var: tk.StringVar, mark) -> None:
-        self._capture = {"var": var, "mark": mark, "after": None}
+        self._hotkey_state = {"var": var, "mark": mark, "after": None}
         mark.configure(text="…", text_color=MUTED)
         if not hotkey_capture.HOOK_READY["ok"]:
             self.hotkey_note.configure(text="Хук недоступен — запись комбинации не работает",
@@ -813,17 +845,17 @@ class App:
         self.root.after(8000, self._capture_timeout)
 
     def _capture_poll(self) -> None:
-        if self._capture is None:
+        if self._hotkey_state is None:
             return
         combo = hotkey_capture.poll_capture()
         if combo is None:
-            self._capture["after"] = self.root.after(60, self._capture_poll)
+            self._hotkey_state["after"] = self.root.after(60, self._capture_poll)
             return
-        mark = self._capture["mark"]
+        mark = self._hotkey_state["mark"]
         if not combo:
             mark.configure(text="")
             self.hotkey_note.configure(text="Запись отменена", text_color=MUTED)
-            self._capture = None
+            self._hotkey_state = None
             return
         error = _combo_error(combo)
         if not error and not self._combo_free(combo):
@@ -834,18 +866,18 @@ class App:
             self.hotkey_note.configure(text=f"{error}. Старое значение оставлено.",
                                        text_color="#e0554f")
         else:
-            self._capture["var"].set(combo)
+            self._hotkey_state["var"].set(combo)
             mark.configure(text="✓", text_color="#4caf68")
             self.hotkey_note.configure(text=f"Записано: {combo}", text_color="#4caf68")
             self._schedule_apply()
-        self._capture = None
+        self._hotkey_state = None
 
     def _capture_timeout(self) -> None:
-        if self._capture is None:
+        if self._hotkey_state is None:
             return
         hotkey_capture.cancel_capture()
-        self._capture["mark"].configure(text="")
-        self._capture = None
+        self._hotkey_state["mark"].configure(text="")
+        self._hotkey_state = None
 
     @staticmethod
     def _combo_free(combo: str) -> bool:
@@ -1328,7 +1360,7 @@ class App:
             return
         self._start_recording(push_to_talk=True, source="хоткей")
         # опрос всегда: хук не видит клавиши, если активное окно запущено от админа
-        threading.Thread(target=self._watch_release, args=(self.stop_event,), daemon=True).start()
+        self._spawn(self._watch_release, self.stop_event)
 
     def _start_recording(self, push_to_talk: bool, source: str) -> None:
         """Старт записи. Распознавание предыдущей фразы не мешает — оно в очереди."""
@@ -1348,7 +1380,30 @@ class App:
         path = history.take_path()
         self._last_take = path
         trace(f"запись ({source}): {path}")
-        threading.Thread(target=self._capture, args=(path, push_to_talk), daemon=True).start()
+        self._record_thread = self._spawn(self._record_to_queue, path, push_to_talk)
+
+    def _spawn(self, target, *args) -> threading.Thread:
+        """Поток с видимой ошибкой.
+
+        В windowed-сборке у потока нет ни stderr, ни диалога: исключение молча
+        убивало его, а флаги оставались в состоянии «пишем» — запись висела,
+        «Стоп» ничего не делал. Теперь любой сбой потока сбрасывает состояние.
+        """
+        name = getattr(target, "__name__", "поток")
+
+        def runner() -> None:
+            try:
+                target(*args)
+            except BaseException as exc:      # noqa: BLE001 — нам нужен любой сбой
+                trace_exc(f"поток {name}: {type(exc).__name__}")
+                self.recording = False
+                self.ptt_active = False
+                self.events.put(("status", f"Сбой записи: {exc}"))
+                self.events.put(("reset_button", None))
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        return thread
 
     def _queue_suffix(self) -> str:
         depth = self.queue.depth
@@ -1366,7 +1421,7 @@ class App:
             return False
         return True
 
-    def _capture(self, path, push_to_talk: bool) -> None:
+    def _record_to_queue(self, path, push_to_talk: bool) -> None:
         """Пишет реплику в файл и ставит её в очередь распознавания."""
         try:
             self.recorder.record_to_file(
@@ -1383,12 +1438,18 @@ class App:
             self.events.put(("captured", path))
             self.queue.submit(path, self.paste_target)
             self.events.put(("queue_state", self.queue.depth))
+        except RecordingStopped:
+            # пользователь сам нажал «Стоп»: это не ошибка, диалог не нужен
+            trace("запись остановлена пользователем")
+            self.events.put(("overlay", ("Остановлено", "#8b9199", 800)))
         except RecorderError as exc:
             trace(f"запись не удалась: {exc}")
             self.events.put(("status", str(exc)))
             self.events.put(("overlay", (str(exc)[:60], "#e05555", 2500)))
-            if "икрофон" in str(exc) or "ечь" in str(exc):
-                self.events.put(("mic_problem", str(exc)))
+            text = str(exc)
+            if any(marker in text for marker in ("не отдаёт звук", "Не удалось открыть",
+                                                 "недоступен", "не слышит речь")):
+                self.events.put(("mic_problem", text))
         except Exception as exc:
             trace_exc("recording error")
             self.events.put(("status", f"Ошибка записи: {exc}"))

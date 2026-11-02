@@ -1,4 +1,10 @@
-"""Режим переключателя: первое нажатие старт, второе — стоп."""
+"""Режим переключателя: старт записи действительно запускает поток, стоп работает.
+
+Регрессия 0.9.0.1–0.9.1.1: метод записи `_capture` перекрывался атрибутом
+`self._capture` (состояние записи хоткея, изначально None), поток стартовал
+с target=None, падал с TypeError, а флаг `recording` оставался включённым —
+запись «висела», «Стоп» не срабатывал, индикатор уровня не двигался.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,7 @@ import app as app_module  # noqa: E402
 
 
 class DummyEngine:
-    """Без torch и модели: проверяем только логику переключателя."""
+    """Без torch и модели: проверяем только запуск и остановку записи."""
 
     def __init__(self, *args, **kwargs):
         self.name = "dummy"
@@ -26,8 +32,20 @@ class DummyEngine:
     def transcribe(self, audio, **kwargs) -> str:
         return ""
 
+    def transcribe_file(self, path, **kwargs) -> str:
+        return ""
+
     def dispose(self) -> None:
         pass
+
+
+def wait(condition, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def main() -> int:
@@ -37,25 +55,49 @@ def main() -> int:
     root.withdraw()
     instance = app_module.App(root, app_module.Config({"hotkey_mode": "toggle"}))
 
-    def slow_record(path, **kwargs):
-        time.sleep(5)
+    calls = {"record": 0}
+
+    def fake_record(path, **kwargs):
+        calls["record"] += 1
+        stop = kwargs.get("stop_event")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if stop is not None and stop.is_set():
+                raise app_module.RecordingStopped()
+            time.sleep(0.02)
         return path
 
-    instance.recorder.record_to_file = slow_record
+    instance.recorder.record_to_file = fake_record
     instance.queue.submit = lambda *args, **kwargs: None
 
-    instance.on_hotkey()
-    time.sleep(0.1)
-    started = instance.recording and instance.stop_event is not None
-    print(f"старт по нажатию: {started}")
+    # метод записи не должен быть перекрыт атрибутом
+    method_ok = callable(instance._record_to_queue)
 
     instance.on_hotkey()
-    time.sleep(0.1)
-    stopped = instance.stop_event is None or instance.stop_event.is_set()
-    print(f"стоп по второму нажатию: {stopped}")
+    time.sleep(0.15)
+    started = instance.recording and calls["record"] == 1
+    thread_alive = instance._record_thread is not None and instance._record_thread.is_alive()
+    print(f"старт: recording={instance.recording}, запись вызвана={calls['record']}, "
+          f"поток={thread_alive}")
+
+    instance.on_hotkey()
+    stopped = wait(lambda: not instance.recording)
+    print(f"стоп: recording={instance.recording}, отработал={stopped}")
+
+    # сбой в потоке не должен оставлять запись «включённой»
+    def boom(*args):
+        raise RuntimeError("тестовый сбой")
+
+    instance._record_to_queue = boom
+    instance.recording = False
+    instance.toggle_recording()
+    crashed_ok = wait(lambda: not instance.recording)
+    print(f"сбой потока сбрасывает состояние: {crashed_ok}")
 
     instance._quit()
-    return 0 if (started and stopped) else 1
+    ok = method_ok and started and thread_alive and stopped and crashed_ok
+    print("результат:", "ok" if ok else "ОШИБКА")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

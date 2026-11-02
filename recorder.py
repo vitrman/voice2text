@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 import wave
 from pathlib import Path
@@ -25,6 +27,13 @@ NO_SPEECH_SECONDS = 60.0      # столько ждём речь, потом ч�
 
 class RecorderError(RuntimeError):
     pass
+
+
+class RecordingStopped(RecorderError):
+    """Запись остановил сам пользователь — это не ошибка и не повод для диалога."""
+
+    def __init__(self, message: str = "Запись остановлена"):
+        super().__init__(message)
 
 
 def _to_int16(audio: np.ndarray) -> np.ndarray:
@@ -96,7 +105,11 @@ def device_index(spec, log=print) -> tuple[int | None, bool]:
     if spec is None or spec == "":
         return None, True
     if isinstance(spec, int):          # старый конфиг: индекс
-        return spec, True
+        items = input_device_items()
+        if any(item["index"] == spec for item in items):
+            return spec, True
+        log(f"сохранённый номер микрофона {spec} больше не существует — беру по умолчанию")
+        return None, False
     name = str(spec.get("name") or "").strip()
     if not name:
         return None, True
@@ -115,6 +128,71 @@ def device_index(spec, log=print) -> tuple[int | None, bool]:
     return int(matches[0]["index"]), True
 
 
+def open_input_stream(device_spec=None, block_ms: int = BLOCK_MS, log=print,
+                      timeout: float = 4.0, total: float = 10.0, should_stop=None):
+    """Открывает вход, перебирая варианты и не давая драйверу зависнуть.
+
+    Открытие и запуск потока выполняются в отдельном потоке с таймаутом: на части
+    драйверов `start()` не возвращает управление, и запись выглядела зависшей —
+    «Слушаю…» навсегда, индикатор уровня стоит, кнопка «Стоп» не помогает.
+    should_stop проверяется, пока ждём: нажатие «Стоп» во время открытия тоже работает.
+    """
+    index, _found = device_index(device_spec, log) if device_spec is not None else (None, True)
+    base = {"channels": 1, "dtype": "float32", "device": index}
+    attempts = []
+    if block_ms:
+        # сначала самый совместимый вариант: 16 кГц с фиксированным блоком и обычной
+        # задержкой. «high» добавляем вторым — на части драйверов он и вешает start()
+        attempts.append({**base, "samplerate": TARGET_SR,
+                         "blocksize": int(TARGET_SR * block_ms / 1000)})
+        attempts.append({**base, "samplerate": TARGET_SR, "latency": "high",
+                         "blocksize": int(TARGET_SR * block_ms / 1000)})
+    attempts.append({**base, "samplerate": TARGET_SR})
+    attempts.append(dict(base))
+
+    deadline = time.monotonic() + total
+    last_error = None
+    for number, kwargs in enumerate(attempts, 1):
+        if should_stop is not None and should_stop():
+            raise RecordingStopped()
+        remaining = min(timeout, deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        started = time.perf_counter()
+        holder: dict = {}
+
+        def worker(params=kwargs, box=holder) -> None:
+            try:
+                stream = sd.InputStream(**params)
+                stream.start()
+                box["stream"] = stream
+            except Exception as exc:      # ошибка драйвера — пробуем следующий вариант
+                box["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        attempt_deadline = time.monotonic() + remaining
+        while thread.is_alive() and time.monotonic() < attempt_deadline:
+            thread.join(0.2)
+            if should_stop is not None and should_stop():
+                raise RecorderError("Запись остановлена")
+        if thread.is_alive():
+            log(f"микрофон: вариант {number} не ответил за {remaining:.0f} с — пробую другой")
+            last_error = RecorderError("устройство не отвечает при открытии")
+            continue
+        if "error" in holder:
+            last_error = holder["error"]
+            log(f"микрофон: вариант {number} не открылся ({last_error})")
+            continue
+        stream = holder["stream"]
+        rate = int(kwargs.get("samplerate")
+                   or sd.query_devices(kind="input")["default_samplerate"])
+        log(f"микрофон: открыт за {time.perf_counter() - started:.2f} с, "
+            f"{rate} Гц, вариант {number}")
+        return stream, rate
+    raise RecorderError(f"Не удалось открыть микрофон: {last_error}")
+
+
 class MicRecorder:
     """Пишет одну реплику в WAV. Ограничения длины нет, кроме страховки 30 минут."""
 
@@ -123,14 +201,9 @@ class MicRecorder:
         self.log = log
         self.device = device
         self.last_overflow_ms = 0     # сколько звука потеряно из-за переполнения буфера
-
-    def _open_stream(self, sample_rate: int | None, device: int | None):
-        if sample_rate:
-            return sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32",
-                                  device=device, latency="high",
-                                  blocksize=int(sample_rate * self.block_ms / 1000)), sample_rate
-        return sd.InputStream(channels=1, dtype="float32", device=device, latency="high"), \
-            int(sd.query_devices(kind="input")["default_samplerate"])
+        self.read_timeout = 3.0       # столько ждём данные, прежде чем считать устройство мёртвым
+        self.block_timeout = 0.2      # шаг проверки стопа, пока данных нет
+        self.open_timeout = 4.0       # столько ждём открытия потока на один вариант настроек
 
     def record_to_file(self, path: Path, silence_ms: int = 700, start_timeout: float = 8.0,
                        on_level=None, push_to_talk: bool = False, stop_event=None,
@@ -141,24 +214,16 @@ class MicRecorder:
         wait_timeout = min(start_timeout, NO_SPEECH_SECONDS) if auto_stop else NO_SPEECH_SECONDS
         limit_blocks = int(limit_seconds * 1000 / self.block_ms)
 
-        index, _found = device_index(self.device, self.log) if self.device is not None else (None, True)
-        try:
-            stream, sr = self._open_stream(TARGET_SR, index)
-            stream.start()
-        except Exception:
-            try:
-                stream, sr = self._open_stream(None, index)
-                stream.start()
-                self.log(f"микрофон не отдал 16 кГц, пишу в {sr} Гц и ресемплирую")
-            except Exception as exc:
-                raise RecorderError(f"Не удалось открыть микрофон: {exc}") from exc
+        stream, sr = open_input_stream(
+            self.device, self.block_ms, self.log, timeout=self.open_timeout,
+            should_stop=(lambda: stop_event is not None and stop_event.is_set()))
 
         if sr != TARGET_SR:
             # редкий случай: поток не отдаёт 16 кГц. Тогда пишем в памяти и ресемплируем
             stream.stop()
             stream.close()
             self.log("устройство не поддерживает 16 кГц — пишу с ресемплированием")
-            audio = self._record_memory(sr=sr, device=index, silence_ms=silence_ms,
+            audio = self._record_memory(sr=sr, device_spec=self.device, silence_ms=silence_ms,
                                         start_timeout=start_timeout, on_level=on_level,
                                         push_to_talk=push_to_talk, stop_event=stop_event,
                                         limit_seconds=limit_seconds)
@@ -180,14 +245,52 @@ class MicRecorder:
         lost_blocks = 0
         limited = False
 
+        # Чтение из устройства — в отдельном потоке, основной цикл берёт блоки из
+        # очереди с таймаутом. Иначе зависший stream.read (устройство перестало
+        # отдавать звук или выбран не тот вход) блокировал всё, и кнопка «Стоп»
+        # не срабатывала: событие ставилось, но проверить его было некому.
+        audio_queue: queue.Queue = queue.Queue(maxsize=40)
+        reader_stop = threading.Event()
+
+        def pump() -> None:
+            while not reader_stop.is_set():
+                try:
+                    block, overflowed = stream.read(frames_per_block)
+                except Exception as exc:          # устройство отвалилось
+                    audio_queue.put(("error", exc))
+                    return
+                if reader_stop.is_set():
+                    return
+                try:
+                    audio_queue.put(("data", (block, overflowed)), timeout=0.5)
+                except queue.Full:
+                    pass                          # не успеваем — блок теряется
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+
         path.parent.mkdir(parents=True, exist_ok=True)
         writer = wave.open(str(path), "wb")
         writer.setnchannels(1)
         writer.setsampwidth(2)
         writer.setframerate(TARGET_SR)
+        last_data = time.monotonic()
         try:
             while blocks < limit_blocks:
-                block, overflowed = stream.read(frames_per_block)
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    kind, payload = audio_queue.get(timeout=self.block_timeout)
+                except queue.Empty:
+                    if time.monotonic() - last_data > self.read_timeout:
+                        raise RecorderError(
+                            "Микрофон не отдаёт звук — проверьте устройство "
+                            "кнопкой «Проверить микрофон»")
+                    continue
+                last_data = time.monotonic()
+                if kind == "error":
+                    raise RecorderError(f"Микрофон недоступен: {payload}")
+                block, overflowed = payload
                 blocks += 1
                 if overflowed:
                     lost_blocks += 1
@@ -265,9 +368,14 @@ class MicRecorder:
             else:
                 limited = True
         finally:
+            reader_stop.set()
             writer.close()
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+            reader.join(timeout=0.5)
 
         self.last_overflow_ms = lost_blocks * self.block_ms
         if self.last_overflow_ms:
@@ -282,31 +390,66 @@ class MicRecorder:
                 raise RecorderError("Слишком коротко — держите клавиши, пока говорите")
         if not speaking:
             path.unlink(missing_ok=True)
+            if stop_event is not None and stop_event.is_set():
+                raise RecordingStopped()     # пользователь сам остановил — не ошибка
             raise RecorderError("Речь не обнаружена")
         return path
 
-    def _record_memory(self, *, sr: int, device, silence_ms: int, start_timeout: float,
+    def _record_memory(self, *, sr: int, device_spec, silence_ms: int, start_timeout: float,
                        on_level, push_to_talk: bool, stop_event, limit_seconds: float) -> np.ndarray:
         """Запасной путь для устройств без 16 кГц: копим в памяти и ресемплируем."""
-        stream, real_sr = self._open_stream(None, device)
-        stream.start()
+        stream, real_sr = open_input_stream(device_spec, self.block_ms, self.log,
+                                            timeout=self.open_timeout)
         frames_per_block = max(1, int(real_sr * self.block_ms / 1000))
         limit_blocks = int(limit_seconds * 1000 / self.block_ms)
         collected: list[np.ndarray] = []
+
+        # как и в основном пути: чтение в отдельном потоке, чтобы зависшее устройство
+        # не блокировало остановку
+        audio_queue: queue.Queue = queue.Queue(maxsize=40)
+        reader_stop = threading.Event()
+
+        def pump() -> None:
+            while not reader_stop.is_set():
+                try:
+                    block, _overflowed = stream.read(frames_per_block)
+                except Exception:
+                    return
+                if reader_stop.is_set():
+                    return
+                try:
+                    audio_queue.put(block, timeout=0.5)
+                except queue.Full:
+                    pass
+
+        threading.Thread(target=pump, daemon=True).start()
+        last_data = time.monotonic()
         try:
-            for _ in range(limit_blocks):
-                block, _overflowed = stream.read(frames_per_block)
+            while len(collected) < limit_blocks:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    block = audio_queue.get(timeout=self.block_timeout)
+                except queue.Empty:
+                    if time.monotonic() - last_data > self.read_timeout:
+                        raise RecorderError(
+                            "Микрофон не отдаёт звук — проверьте устройство "
+                            "кнопкой «Проверить микрофон»")
+                    continue
+                last_data = time.monotonic()
                 mono = block[:, 0] if block.ndim > 1 else block
                 collected.append(np.asarray(mono, dtype=np.float32))
                 if on_level is not None:
                     on_level(0.0, True)
-                if stop_event is not None and stop_event.is_set():
-                    break
                 if silence_ms > 0 and len(collected) * self.block_ms > silence_ms:
                     break
         finally:
-            stream.stop()
-            stream.close()
+            reader_stop.set()
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
         if not collected:
             raise RecorderError("Речь не обнаружена")
         audio = _resample(np.concatenate(collected), real_sr)

@@ -43,8 +43,34 @@ def main() -> int:
     assert script.read_bytes().startswith(b"\xef\xbb\xbf"), (
         "tools/publish_release.ps1 должен быть в UTF-8 с BOM")
 
+    # атрибут вида self.capture = None перекрывает метод capture: именно так запись
+    # перестала запускаться в 0.9.0.1 — поток стартовал с target=None
+    for module in ("app.py", "first_run.py", "mic_check.py", "recorder.py", "jobs.py"):
+        clashes = shadowed_methods(ROOT / module)
+        assert not clashes, f"{module}: атрибуты перекрывают методы: {clashes}"
+
     print(f"ok: {version.VERSION}")
     return 0
+
+
+def shadowed_methods(path: pathlib.Path) -> list[str]:
+    """Имена методов класса, которые перекрываются атрибутами self.<имя>."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    result = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        methods = {item.name for item in node.body if isinstance(item, ast.FunctionDef)}
+        attrs = set()
+        for item in ast.walk(node):
+            if isinstance(item, ast.Attribute) and isinstance(item.ctx, ast.Store):
+                base = item.value
+                if isinstance(base, ast.Name) and base.id == "self":
+                    attrs.add(item.attr)
+        result += [f"{node.name}.{name}" for name in sorted(methods & attrs)]
+    return result
 
 
 if __name__ == "__main__":

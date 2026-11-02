@@ -4,6 +4,11 @@ transcripts/
 __pycache__/
 *.pyc
 config.json
+config.json.bak
+config.json.tmp
+history.log
+history.*.log
+last/
 
 # сборки и артефакты (пересобираются, в git не нужны)
 dist/

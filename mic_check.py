@@ -13,7 +13,7 @@ import customtkinter as ctk
 import numpy as np
 import sounddevice as sd
 
-from recorder import TARGET_SR, device_index
+from recorder import TARGET_SR, device_index, open_input_stream
 from theme import BORDER, CARD, CARD_HOVER, ERROR, MUTED, OK, TEXT, WARN
 
 BLOCK = 0.05
@@ -56,13 +56,8 @@ class MicChecker:
         self._stop.set()
 
     def _run(self) -> None:
-        index, _found = (device_index(self.device, self.log)
-                         if self.device is not None else (None, True))
         try:
-            stream = sd.InputStream(samplerate=TARGET_SR, channels=1, dtype="float32",
-                                    device=index, latency="high",
-                                    blocksize=int(TARGET_SR * BLOCK))
-            stream.start()
+            stream, _rate = open_input_stream(self.device, int(BLOCK * 1000), self.log)
         except Exception as exc:
             self.error = str(exc)
             return

@@ -16,7 +16,7 @@ import history
 import model_fetch
 from asr_engine import MODEL_DIR
 from mic_check import MicCheckFrame
-from recorder import MicRecorder, RecorderError
+from recorder import MicRecorder, RecorderError, RecordingStopped
 from theme import (ACCENT, ACCENT_HOVER, BG, BORDER, CARD, CARD_HOVER, ERROR, MUTED,
                    OK, TEXT, WARN)
 
@@ -219,6 +219,11 @@ class FirstRunWizard(ctk.CTkToplevel):
                 recorder.record_to_file(path, silence_ms=0, start_timeout=6.0,
                                         stop_event=self._stop_event, limit_seconds=6.0)
                 text = self.engine.transcribe_file(path)
+            except RecordingStopped:
+                # таймер визарда остановил запись, а речи не было — это не ошибка
+                self.after(0, lambda: self._phrase_done("Ничего не услышали, попробуйте ещё раз",
+                                                        error=True))
+                return
             except RecorderError as exc:
                 self.after(0, lambda: self._phrase_done(str(exc), error=True))
                 return
