@@ -60,7 +60,9 @@ def main() -> int:
         print("говорите…", file=sys.stderr)
         audio = MicRecorder().record()
 
-    text = engine.transcribe(audio)
+    from postprocess import drop_fillers
+
+    text = drop_fillers(engine.transcribe(audio))
     print(text)
     print(f"[{time.perf_counter() - started:.1f} с, модель {engine.name}]", file=sys.stderr)
     return 0

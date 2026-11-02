@@ -26,7 +26,7 @@ import history
 import hotkey_capture
 from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
 from jobs import TranscriptionQueue
-from postprocess import apply_replacements, tidy
+from postprocess import apply_replacements, drop_fillers, tidy
 from recorder import MicRecorder, RecorderError, RecordingStopped
 from theme import (ACCENT, ACCENT_HOVER, BG, BORDER, CARD, CARD_HOVER, MUTED,
                    RECORD, RECORD_HOVER, TEXT)
@@ -1464,6 +1464,8 @@ class App:
         text = self.engine.transcribe_file(path,
                                           chunk_seconds=float(self.config["chunk_seconds"]),
                                           cancel=cancel)
+        # сначала звуки-заполнители, потом словарь замен, потом мелочи форматирования
+        text = drop_fillers(text, log=lambda message: trace(f"заполнители: {message}"))
         return tidy(apply_replacements(text, self.config.get("replacements") or {}))
 
     def _queue_text(self, text: str, task: dict) -> None:
