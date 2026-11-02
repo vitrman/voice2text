@@ -196,6 +196,13 @@ try {
     throw
 }
 Write-Host "Repository: $($repoInfo.full_name) ($($repoInfo.visibility))"
+if ($null -ne $repoInfo.permissions -and -not $repoInfo.permissions.push) {
+    Write-Host "Токен видит репозиторий, но без права записи — релиз создать не сможет." -ForegroundColor Red
+    Write-Host "  fine-grained: Permissions -> Contents: Read and write"
+    Write-Host "  classic:      scope repo"
+    Write-Host "  затем:        release_github.cmd -NewToken"
+    exit 1
+}
 
 Write-Host "Looking for release $tag..."
 $release = $null
@@ -223,7 +230,16 @@ if (-not $release) {
             -Headers $headers -Method Post -Body $bytes `
             -ContentType "application/json; charset=utf-8"
     } catch {
+        $code = $_.Exception.Response.StatusCode.value__
         $detail = $_.ErrorDetails.Message
+        if ($code -eq 403) {
+            Write-Host "GitHub отказал в создании релиза (403): у токена нет права на запись." -ForegroundColor Red
+            Write-Host "  fine-grained: Permissions -> Contents: Read and write (для этого репозитория)"
+            Write-Host "  classic:      scope repo"
+            Write-Host "  затем:        release_github.cmd -NewToken"
+            if ($detail) { Write-Host "  Ответ GitHub: $detail" -ForegroundColor DarkGray }
+            exit 1
+        }
         if ($detail) { Write-Host "GitHub: $detail" -ForegroundColor Red }
         throw
     }
@@ -231,11 +247,36 @@ if (-not $release) {
     Write-Host "Release exists, uploading asset..."
 }
 
-$uploadUrl = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$($archive.Name)"
-Write-Host "Uploading $($archive.Name)..."
-Invoke-RestMethod -Uri $uploadUrl -Headers $headers -Method Post -InFile $archive.FullName -ContentType "application/zip" | Out-Null
+function Publish-Asset([string]$name, [string]$path, [string]$contentType) {
+    $url = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$name"
+    Write-Host "Uploading $name..."
+    try {
+        Invoke-RestMethod -Uri $url -Headers $headers -Method Post -InFile $path `
+            -ContentType $contentType | Out-Null
+        return
+    } catch {
+        $code = $_.Exception.Response.StatusCode.value__
+        if ($code -ne 422) {
+            if ($code -eq 403) {
+                Write-Host "Загрузка отклонена (403): токену нужно право Contents: Read and write." -ForegroundColor Red
+                exit 1
+            }
+            throw
+        }
+    }
+    # 422 — файл с таким именем уже есть (например, повторный запуск): заменяем
+    Write-Host "  файл уже был в релизе, заменяю"
+    $assets = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/$($release.id)/assets" -Headers $headers -Method Get
+    foreach ($asset in $assets) {
+        if ($asset.name -eq $name) {
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/assets/$($asset.id)" `
+                -Headers $headers -Method Delete | Out-Null
+        }
+    }
+    Invoke-RestMethod -Uri $url -Headers $headers -Method Post -InFile $path `
+        -ContentType $contentType | Out-Null
+}
 
-$hashUrl = "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$([IO.Path]::GetFileName($hashFile))"
-Write-Host "Uploading $([IO.Path]::GetFileName($hashFile))..."
-Invoke-RestMethod -Uri $hashUrl -Headers $headers -Method Post -InFile $hashFile -ContentType "text/plain" | Out-Null
+Publish-Asset $archive.Name $archive.FullName "application/zip"
+Publish-Asset ([IO.Path]::GetFileName($hashFile)) $hashFile "text/plain"
 Write-Host "Release page: https://github.com/$Repo/releases/tag/$tag"
