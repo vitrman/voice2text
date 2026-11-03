@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import wave
@@ -74,26 +75,88 @@ def read_wav_int16(path: Path) -> np.ndarray:
     return data.mean(axis=1).astype(np.int16)
 
 
-def input_device_items() -> list[dict]:
-    """Входные устройства с именем и host API — имя переживает переподключение."""
-    items: list[dict] = []
+# Порядок предпочтения host API: WASAPI родной для Windows 10/11, MME — последний
+# как самый совместимый. WDM-KS эксклюзивный, его показываем только если ничего нет.
+HOSTAPI_PRIORITY = {"Windows WASAPI": 1, "Windows DirectSound": 2, "MME": 3}
+HOSTAPI_FALLBACK = 4
+
+# Виртуальные endpoints: без отдельного запроса они только путают список
+VIRTUAL_MARKERS = ("переназначение", "стерео микшер", "первичный драйвер записи",
+                   "redirect", "stereo mix", "primary sound")
+
+
+def hostapi_names() -> list[str]:
+    try:
+        return [str(item.get("name") or "") for item in sd.query_hostapis()]
+    except Exception:
+        return []
+
+
+def _normalized_name(name: str) -> str:
+    """Одно и то же устройство в разных host API называется одинаково."""
+    text = re.sub(r"\s*-\s*Input\s*$", "", str(name).strip(), flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def input_device_items(all_variants: bool = False) -> list[dict]:
+    """Входные устройства с именем и host API.
+
+    По умолчанию список схлопнут: одно физическое устройство PortAudio показывает
+    по разу на каждый host API (MME, DirectSound, WASAPI, WDM-KS), из-за чего в
+    настройках было 16 пунктов вместо 4. Оставляем лучший вариант — WASAPI,
+    затем DirectSound, затем MME. all_variants=True возвращает всё как есть.
+    """
     try:
         devices = sd.query_devices()
     except Exception:
-        return items
+        return []
+    apis = hostapi_names()
+    raw: list[dict] = []
     for index, device in enumerate(devices):
-        if device.get("max_input_channels", 0) > 0:
-            items.append({
-                "index": index,
-                "name": str(device.get("name") or f"устройство {index}"),
-                "hostapi": int(device.get("hostapi") or 0),
-                "label": f"{index}: {device.get('name')}",
-            })
-    return items
+        if device.get("max_input_channels", 0) <= 0:
+            continue
+        api_index = int(device.get("hostapi") or 0)
+        api = apis[api_index] if api_index < len(apis) else ""
+        name = str(device.get("name") or f"устройство {index}")
+        raw.append({
+            "index": index,
+            "name": name,
+            "hostapi": api_index,
+            "api": api,
+            "priority": HOSTAPI_PRIORITY.get(api, HOSTAPI_FALLBACK),
+            "virtual": any(marker in name.lower() for marker in VIRTUAL_MARKERS),
+            "label": f"{index}: {name}",
+        })
+    if all_variants:
+        return raw
+
+    groups: dict[str, list[dict]] = {}
+    for item in raw:
+        # WDM-KS (и неизвестные API) — эксклюзивный режим, в обычном списке он только
+        # мешает; такие устройства доступны через «Показывать все драйверы»
+        if item["priority"] >= HOSTAPI_FALLBACK:
+            continue
+        groups.setdefault(_normalized_name(item["name"]), []).append(item)
+
+    result: list[dict] = []
+    for items in groups.values():
+        best = min(item["priority"] for item in items)
+        candidates = [item for item in items if item["priority"] == best]
+        candidates.sort(key=lambda item: item["index"])
+        for position, item in enumerate(candidates, 1):
+            label = f"{item['index']}: {item['name']}"
+            if len(candidates) > 1:      # две одинаковые гарнитуры — различимы
+                label += f" ({position})"
+            result.append({**item, "label": label})
+
+    # сначала обычные устройства в порядке предпочтения API, виртуальные — в конце
+    result.sort(key=lambda item: (item["virtual"], item["priority"],
+                                  _normalized_name(item["name"]), item["index"]))
+    return result
 
 
-def list_input_devices() -> list[str]:
-    return [item["label"] for item in input_device_items()]
+def list_input_devices(all_variants: bool = False) -> list[str]:
+    return [item["label"] for item in input_device_items(all_variants)]
 
 
 def device_index(spec, log=print) -> tuple[int | None, bool]:
@@ -105,7 +168,7 @@ def device_index(spec, log=print) -> tuple[int | None, bool]:
     if spec is None or spec == "":
         return None, True
     if isinstance(spec, int):          # старый конфиг: индекс
-        items = input_device_items()
+        items = input_device_items(all_variants=True)
         if any(item["index"] == spec for item in items):
             return spec, True
         log(f"сохранённый номер микрофона {spec} больше не существует — беру по умолчанию")
@@ -114,7 +177,8 @@ def device_index(spec, log=print) -> tuple[int | None, bool]:
     if not name:
         return None, True
     hostapi = spec.get("hostapi")
-    items = input_device_items()
+    # с сохранённым host API ищем по всем вариантам: пользователь мог выбрать MME
+    items = input_device_items(all_variants=hostapi is not None)
     matches = [item for item in items if item["name"] == name]
     if not matches:
         matches = [item for item in items if item["name"].lower() == name.lower()]

@@ -175,9 +175,13 @@ build.cmd                                          :: -> dist\Voice2Text
 ## Настройки
 
 `config.json`: `model` (`v3_e2e_rnnt`/`v3_e2e_ctc`), `device` (`{"name": …, "hostapi": …}`
-или `null` — микрофон хранится по имени, а не по номеру), `hotkey`, `show_hotkey`,
+или `null` — микрофон хранится по имени, а не по номеру), `show_all_devices` (показывать
+все host API, а не только лучший), `hotkey`, `show_hotkey`,
 `hotkey_mode` (`toggle`/`hold`), `silence_ms`, `auto_stop`, `chunk_seconds`,
 `autopaste`, `start_minimized`, `replacements`, `check_updates`, `github_repo`.
+
+Список микрофонов схлопнут: одно устройство показывается одним пунктом (WASAPI, если
+доступен), а полный список драйверов открывается галочкой «Показывать все драйверы».
 
 Длительность записи не настраивается: пишем в файл, пока не остановят, со страховкой
 30 минут.
@@ -232,6 +236,7 @@ build.cmd                                          :: -> dist\Voice2Text
 .venv\Scripts\python.exe tests\test_stop_button.py        :: стоп по кнопке и зависшее устройство
 .venv\Scripts\python.exe tests\test_queue_and_history.py  :: очередь, история, запись в файл
 .venv\Scripts\python.exe tests\test_startup.py            :: автозапуск и вердикты микрофона
+.venv\Scripts\python.exe tests\test_devices.py            :: список микрофонов без дублей host API
 .venv\Scripts\python.exe tests\test_fillers.py            :: слова-паразиты: что убрать и что нельзя
 .venv\Scripts\python.exe smoke_test.py            :: сквозная проверка на тестовом WAV
 ```

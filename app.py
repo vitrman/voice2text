@@ -44,10 +44,10 @@ from paths import DATA, ROOT
 DEFAULT_REPO = "vitrman/voice2text"
 
 
-def _input_devices() -> list[str]:
+def _input_devices(all_variants: bool = False) -> list[str]:
     try:
         from recorder import list_input_devices
-        return ["По умолчанию"] + list_input_devices()
+        return ["По умолчанию"] + list_input_devices(all_variants)
     except Exception:
         return ["По умолчанию"]
 
@@ -648,7 +648,7 @@ class App:
 
         self._panel_label("Микрофон")
         self.var_device = tk.StringVar(value=self._device_label())
-        device_box = ctk.CTkComboBox(panel, values=_input_devices(), variable=self.var_device,
+        device_box = ctk.CTkComboBox(panel, values=self._device_values(), variable=self.var_device,
                                      state="readonly", corner_radius=10, fg_color=BG,
                                      border_color=BORDER, button_color=BORDER,
                                      button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
@@ -658,10 +658,16 @@ class App:
         # список устройств обновляем при открытии: воткнутая гарнитура появляется сразу
         device_box.bind("<Button-1>", lambda _e: self._refresh_devices(), add="+")
         self.device_box = device_box
+        self.var_all_devices = tk.BooleanVar(
+            value=bool(self.config.get("show_all_devices", False)))
+        ctk.CTkCheckBox(panel, text="Показывать все драйверы", variable=self.var_all_devices,
+                        font=ctk.CTkFont("Segoe UI", 11), checkbox_width=18, checkbox_height=18,
+                        corner_radius=6, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        command=self._on_all_devices_toggle).pack(anchor="w", padx=16, pady=(0, 2))
         ctk.CTkButton(panel, text="Проверить микрофон", height=30, corner_radius=9,
                       fg_color=CARD_HOVER, hover_color=BORDER, text_color=TEXT,
                       font=ctk.CTkFont("Segoe UI", 12),
-                      command=self._test_microphone).pack(fill="x", padx=16, pady=(0, 4))
+                      command=self._test_microphone).pack(fill="x", padx=16, pady=(4, 4))
 
         self._hotkey_entries: dict[str, object] = {}
         self.var_hotkey = tk.StringVar(value=self.config["hotkey"])
@@ -758,28 +764,43 @@ class App:
             pass
         self.status.set("Готово. Нажмите хоткей и говорите.")
 
+    def _device_values(self) -> list[str]:
+        return _input_devices(bool(self.config.get("show_all_devices", False)))
+
     def _device_label(self) -> str:
         spec = self.config.get("device")
         if spec is None:
             return "По умолчанию"
-        if isinstance(spec, int):          # старый конфиг: номер устройства
-            for label in _input_devices():
-                if label.startswith(f"{spec}:"):
-                    return label
-            return "По умолчанию"
-        name = str((spec or {}).get("name") or "")
         try:
             from recorder import input_device_items
-            for item in input_device_items():
-                if item["name"] == name:
-                    return item["label"]
+            if isinstance(spec, int):          # старый конфиг: номер устройства
+                for item in input_device_items(all_variants=True):
+                    if item["index"] == spec:
+                        return item["label"]
+                return "По умолчанию"
+            name = str((spec or {}).get("name") or "")
+            hostapi = (spec or {}).get("hostapi")
+            items = input_device_items(all_variants=True)
+            matches = [item for item in items if item["name"] == name]
+            if not matches:
+                return "По умолчанию"
+            if hostapi is not None:
+                same_api = [item for item in matches if item["hostapi"] == hostapi]
+                if same_api:
+                    matches = same_api
+            return matches[0]["label"]
         except Exception:
-            pass
-        return "По умолчанию"
+            return "По умолчанию"
+
+    def _on_all_devices_toggle(self) -> None:
+        """Показ всех host API — на случай, если WASAPI на устройстве не работает."""
+        self.config["show_all_devices"] = bool(self.var_all_devices.get())
+        self._refresh_devices()
+        self._schedule_apply()
 
     def _refresh_devices(self) -> None:
         """Воткнутая гарнитура должна появляться без перезапуска приложения."""
-        labels = _input_devices()
+        labels = self._device_values()
         self.device_box.configure(values=labels)
         if self.var_device.get() not in labels:
             self.var_device.set(self._device_label())
@@ -926,6 +947,7 @@ class App:
             "auto_stop": bool(self.var_auto_stop.get()),
             "autopaste": bool(self.autopaste.get()),
             "start_minimized": bool(self.var_minimized.get()),
+            "show_all_devices": bool(self.var_all_devices.get()),
             "replacements": _text_to_replacements(self.txt_replacements.get("1.0", "end-1c")),
         }
         if all(self.config.get(key) == value for key, value in values.items()):
