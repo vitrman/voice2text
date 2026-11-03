@@ -60,6 +60,30 @@ FALLBACKS = {
 }
 
 
+def hotkey_choices() -> list[str]:
+    """Комбинации для выпадающего меню настроек — без свободного ввода с клавиатуры.
+
+    Набор намеренно консервативный: Ctrl/Shift/Alt + безопасная клавиша, без Win
+    (Windows отдаёт такие сочетания системе) и без одиночных клавиш. F1–F12 почти
+    никогда не заняты глобально другими программами, поэтому идут первыми.
+    """
+    combos: list[str] = []
+    for mod in ("ctrl+alt", "ctrl+shift"):
+        for i in range(1, 13):
+            combos.append(f"{mod}+f{i}")
+        combos.append(f"{mod}+space")
+        combos.append(f"{mod}+enter")
+        for ch in "abcdefghijklmnopqrstuvwxyz":
+            combos.append(f"{mod}+{ch}")
+    seen: set[str] = set()
+    out: list[str] = []
+    for combo in combos:
+        if combo not in seen:
+            seen.add(combo)
+            out.append(combo)
+    return out
+
+
 def key_name(vk: int) -> str | None:
     """Имя клавиши по виртуальному коду или None, если не знаем такую."""
     return VK_NAMES.get(vk)

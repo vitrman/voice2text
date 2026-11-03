@@ -31,6 +31,15 @@ def main() -> int:
             continue
         raise AssertionError(f"должно быть отклонено: {bad!r}")
 
+    choices = hotkeys.hotkey_choices()
+    assert choices, "список комбинаций для меню пуст"
+    assert len(choices) == len(set(choices)), "в списке комбинаций есть дубликаты"
+    for combo in choices:
+        assert "win" not in combo.lower(), combo
+        hotkeys.parse_hotkey(combo)          # каждая комбинация из меню разбирается
+    for name, default in hotkeys.DEFAULT_COMBOS.items():
+        assert default in choices, f"умолчание {default} отсутствует в списке меню"
+
     text = (ROOT / "version.py").read_text(encoding="utf-8")
     assert f'"{version.VERSION}"' in text
 

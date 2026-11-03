@@ -25,8 +25,7 @@ import calls
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
 import history
-import hotkey_capture
-from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
+from hotkeys import DEFAULT_COMBOS, HOTKEYS, hotkey_choices, parse_hotkey, probe_hotkey
 from jobs import TranscriptionQueue
 import loopback
 from postprocess import apply_replacements, drop_fillers, tidy
@@ -37,14 +36,17 @@ import update
 from version import VERSION
 import win32
 from win32 import (
-    HOOKPROC, INPUT, KBDLLHOOKSTRUCT, MSG, POINT,
+    INPUT, MSG, POINT,
     KEYEVENTF_KEYUP, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    VK_CONTROL, VK_V, WH_KEYBOARD_LL, WM_HOTKEY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    VK_CONTROL, VK_V, WM_HOTKEY, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 )
 
 from paths import DATA, ROOT
 
 DEFAULT_REPO = "vitrman/voice2text"
+
+# имя действия -> ключ настройки с его комбинацией
+_HOTKEY_CONFIG_KEYS = {"dictate": "hotkey", "show": "show_hotkey", "call": "call_hotkey"}
 
 
 def _input_devices(all_variants: bool = False) -> list[str]:
@@ -90,24 +92,6 @@ def _text_to_replacements(text: str) -> dict:
     return result
 
 
-def _combo_error(combo: str) -> str | None:
-    """Проверка записанной комбинации: текст ошибки или None."""
-    parts = [part for part in combo.lower().split("+") if part]
-    if not parts:
-        return "ничего не нажато"
-    if "win" in parts:
-        return "Win не поддерживается"
-    if len(parts) < 2:
-        return "нужна комбинация: модификатор + клавиша"
-    if not any(part in ("ctrl", "shift", "alt") for part in parts[:-1]):
-        return "добавьте Ctrl, Shift или Alt"
-    try:
-        parse_hotkey(combo)
-    except ValueError as exc:
-        return str(exc)
-    return None
-
-
 def _ensure_streams() -> None:
     """В windowed-сборке sys.stdout/stderr = None, и gigaam/tqdm падают на записи."""
     if sys.stdout is None:
@@ -144,27 +128,6 @@ WM_RELOAD_HOTKEYS = 0x8000 + 1
 WM_RETRY_HOTKEYS = 0x8000 + 2
 HOTKEY_RETRY_SECONDS = 60.0
 _RETRY_STARTED = {"done": False}
-
-
-def _hook_proc(n_code, w_param, l_param):
-    """Только запись комбинации: остановку режима «удерживать» делает опрос клавиш.
-
-    Хук не видит нажатий, когда активное окно запущено от администратора (UIPI),
-    поэтому полагаться на него в остановке записи нельзя.
-    """
-    if n_code == 0 and hotkey_capture.is_active():
-        vk = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
-        hotkey_capture.feed_key(vk, w_param)
-        return 1  # пока пишем комбинацию, клавиши не уходят в окна
-    return USER32.CallNextHookEx(None, n_code, w_param, l_param)
-
-
-def start_keyboard_hook() -> None:
-    def ready() -> None:
-        hotkey_capture.HOOK_READY["ok"] = True
-
-    win32.start_keyboard_hook(_hook_proc, log=trace, on_ready=ready)
-
 
 
 def apply_hotkey_specs(dictate: str, show: str, call: str | None = None) -> bool:
@@ -422,9 +385,6 @@ class App:
             on_state=self._queue_state,
             log=lambda message: trace(f"очередь: {message}"),
         )
-        # состояние записи комбинации: раньше называлось self._capture и перекрывало
-        # одноимённый метод записи — поток стартовал с target=None и молча падал
-        self._hotkey_state = None
         self._record_thread = None    # поток текущей записи: нужен для диагностики
         self._apply_after = None      # отложенное применение настроек
         self._applying = False
@@ -463,7 +423,6 @@ class App:
                               lambda: self._hotkey_event("show"),
                               lambda name, combo: self.events.put(("hotkey_changed", (name, combo))),
                               on_call=lambda: self._hotkey_event("call"))
-        start_keyboard_hook()
         self._setup_tray()
         self._warn_missing_device()
         if not self.config.get("first_run_done"):
@@ -837,14 +796,15 @@ class App:
                       command=self._test_microphone).pack(fill="x", padx=16, pady=(4, 4))
 
         self._hotkey_entries: dict[str, object] = {}
-        self.var_hotkey = tk.StringVar(value=self.config["hotkey"])
-        self._hotkey_row("Хоткей диктовки", self.var_hotkey, "dictate")
-        self.var_show = tk.StringVar(value=self.config["show_hotkey"])
-        self._hotkey_row("Хоткей окна", self.var_show, "show")
-        self.var_call_hotkey = tk.StringVar(value=self.config.get("call_hotkey") or "ctrl+shift+c")
-        self._hotkey_row("Хоткей созвона", self.var_call_hotkey, "call")
+        self._hotkey_choices = hotkey_choices()
+        self.var_hotkey = tk.StringVar(value=self._hotkey_value("dictate"))
+        self._hotkey_menu("Хоткей диктовки", self.var_hotkey, "dictate")
+        self.var_show = tk.StringVar(value=self._hotkey_value("show"))
+        self._hotkey_menu("Хоткей окна", self.var_show, "show")
+        self.var_call_hotkey = tk.StringVar(value=self._hotkey_value("call"))
+        self._hotkey_menu("Хоткей созвона", self.var_call_hotkey, "call")
         self.hotkey_note = self._panel_hint(
-            "Ctrl/Shift/Alt + клавиша. Win и одиночные клавиши не поддерживаются.")
+            "Выберите комбинацию из списка. Занятая другой программой не применяется.")
 
         self._panel_label("Режим хоткея")
         self.var_mode = tk.StringVar(value="удерживать" if self.config.get("hotkey_mode") == "hold"
@@ -978,26 +938,65 @@ class App:
         self.entry_silence.configure(state="normal" if self.var_auto_stop.get() else "disabled")
         self._schedule_apply()
 
-    def _hotkey_row(self, title: str, var: tk.StringVar, name: str) -> None:
+    def _hotkey_value(self, name: str) -> str:
+        """Сохранённая комбинация действия (или умолчание), всегда в нижнем регистре."""
+        value = (self.config.get(_HOTKEY_CONFIG_KEYS[name]) or "").strip().lower()
+        return value or DEFAULT_COMBOS[name]
+
+    def _hotkey_menu(self, title: str, var: tk.StringVar, name: str) -> None:
+        """Выпадающий список вместо свободного ввода и захвата клавиш хуком."""
         self._panel_label(title)
-        holder = ctk.CTkFrame(self.settings_panel, fg_color="transparent")
-        holder.pack(fill="x", padx=16, pady=(0, 4))
-        entry = ctk.CTkEntry(holder, textvariable=var, corner_radius=10, fg_color=BG,
-                             border_color=BORDER, font=ctk.CTkFont("Segoe UI", 12))
-        entry.pack(side="left", fill="x", expand=True)
-        self._hotkey_entries[name] = entry
-        self._bind_apply_on_leave(entry)
-        mark = ctk.CTkLabel(holder, text="", width=16, font=ctk.CTkFont("Segoe UI", 12))
-        mark.pack(side="left", padx=(6, 0))
-        ctk.CTkButton(holder, text="Записать", width=88, height=28, corner_radius=9,
-                      fg_color=BG, hover_color=CARD_HOVER, border_width=1, border_color=BORDER,
-                      text_color=TEXT, font=ctk.CTkFont("Segoe UI", 11),
-                      command=lambda: self._start_capture(var, mark)).pack(side="left", padx=(6, 0))
+        choices = list(self._hotkey_choices)
+        if var.get() and var.get() not in choices:
+            choices.append(var.get())          # текущее значение всегда доступно
+        box = ctk.CTkComboBox(self.settings_panel, values=choices, variable=var,
+                              state="readonly", corner_radius=10, fg_color=BG,
+                              border_color=BORDER, button_color=BORDER,
+                              button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
+                              command=lambda combo, n=name, v=var: self._on_hotkey_pick(n, v, combo),
+                              font=ctk.CTkFont("Segoe UI", 12))
+        box.pack(fill="x", padx=16, pady=(0, 4))
+        self._hotkey_entries[name] = box
+
+    def _on_hotkey_pick(self, name: str, var: tk.StringVar, combo: str) -> None:
+        combo = (combo or "").strip().lower()
+        try:
+            parse_hotkey(combo)
+        except ValueError as exc:
+            var.set(self._hotkey_value(name))
+            self._hotkey_note_error(f"Недопустимая комбинация: {exc}")
+            return
+        conflict = self._hotkey_conflict(name, combo)
+        if conflict:
+            var.set(self._hotkey_value(name))
+            self._hotkey_note_error(conflict)
+            return
+        self.hotkey_note.configure(text=f"Хоткей {combo} будет применён", text_color=MUTED)
+        self.status.set(f"Хоткей {combo} выбран")
+        self._schedule_apply()
+
+    def _hotkey_conflict(self, name: str, combo: str) -> str | None:
+        """Причина, по которой комбинацию нельзя назначить, или None, если можно."""
+        labels = {"dictate": "диктовки", "show": "окна", "call": "созвона"}
+        for other in ("dictate", "show", "call"):
+            if other == name:
+                continue
+            if combo in (HOTKEYS.requested(other), HOTKEYS.actual(other)):
+                return f"{combo} уже занята хоткеем {labels[other]}"
+        if combo in (HOTKEYS.requested(name), HOTKEYS.actual(name)):
+            return None                              # повторный выбор своей же комбинации
+        if not probe_hotkey(combo):
+            return f"{combo} занята другой программой"
+        return None
+
+    def _hotkey_note_error(self, text: str) -> None:
+        self.hotkey_note.configure(text=text, text_color="#e0554f")
+        self.status.set(text)
 
     def _on_hotkey_changed(self, name: str, combo: str | None) -> None:
         """Говорит правду о хоткее: занятую комбинацию больше не прячем в строке статуса.
 
-        В поле остаётся желаемая комбинация (намерение пользователя), а подсказка
+        В списке остаётся желаемая комбинация (намерение пользователя), а подсказка
         и рамка показывают, что реально работает сейчас.
         """
         requested = HOTKEYS.requested(name)
@@ -1022,62 +1021,6 @@ class App:
             self.hotkey_note.configure(text=f"Хоткей {combo} работает", text_color="#4caf68")
             self.status.set(f"Хоткей {combo} снова работает")
         self._refresh_record_button()
-
-    # ---------- запись комбинации в панели ----------
-    def _start_capture(self, var: tk.StringVar, mark) -> None:
-        self._hotkey_state = {"var": var, "mark": mark, "after": None}
-        mark.configure(text="…", text_color=MUTED)
-        if not hotkey_capture.HOOK_READY["ok"]:
-            self.hotkey_note.configure(text="Хук недоступен — запись комбинации не работает",
-                                       text_color="#e0554f")
-            return
-        hotkey_capture.start_capture()
-        self._capture_poll()
-        self.root.after(8000, self._capture_timeout)
-
-    def _capture_poll(self) -> None:
-        if self._hotkey_state is None:
-            return
-        combo = hotkey_capture.poll_capture()
-        if combo is None:
-            self._hotkey_state["after"] = self.root.after(60, self._capture_poll)
-            return
-        mark = self._hotkey_state["mark"]
-        if not combo:
-            mark.configure(text="")
-            self.hotkey_note.configure(text="Запись отменена", text_color=MUTED)
-            self._hotkey_state = None
-            return
-        error = _combo_error(combo)
-        if not error and not self._combo_free(combo):
-            # проверяем сразу: иначе занятая комбинация всплывёт только после перезапуска
-            error = "эта комбинация занята другой программой"
-        if error:
-            mark.configure(text="×", text_color="#e0554f")
-            self.hotkey_note.configure(text=f"{error}. Старое значение оставлено.",
-                                       text_color="#e0554f")
-        else:
-            self._hotkey_state["var"].set(combo)
-            mark.configure(text="✓", text_color="#4caf68")
-            self.hotkey_note.configure(text=f"Записано: {combo}", text_color="#4caf68")
-            self._schedule_apply()
-        self._hotkey_state = None
-
-    def _capture_timeout(self) -> None:
-        if self._hotkey_state is None:
-            return
-        hotkey_capture.cancel_capture()
-        self._hotkey_state["mark"].configure(text="")
-        self._hotkey_state = None
-
-    @staticmethod
-    def _combo_free(combo: str) -> bool:
-        """Свободна ли комбинация: свои собственные считаем свободными."""
-        ours = {HOTKEYS.shown("dictate"), HOTKEYS.shown("show"),
-                HOTKEYS.requested("dictate"), HOTKEYS.requested("show")}
-        if combo in ours:
-            return True
-        return probe_hotkey(combo)
 
     # ---------- применение настроек ----------
     def _schedule_apply(self) -> None:
@@ -1538,9 +1481,6 @@ class App:
               f"(foreground={foreground} own={self._is_own(foreground)})")
 
     def _hotkey_event(self, kind: str) -> None:
-        # пока в настройках пишется комбинация, старые хоткеи не срабатывают
-        if hotkey_capture.is_active():
-            return
         self.events.put((kind, None))
 
     def on_hotkey(self) -> None:
