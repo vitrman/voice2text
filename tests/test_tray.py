@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sys
 import time
-import tkinter as tk
 from pathlib import Path
+
+import customtkinter as ctk
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -13,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 import app as app_module  # noqa: E402
 
 
-def pump(root: tk.Tk, seconds: float) -> None:
+def pump(root, seconds: float) -> None:
     deadline = time.time() + seconds
     while time.time() < deadline:
         root.update()
@@ -21,7 +22,8 @@ def pump(root: tk.Tk, seconds: float) -> None:
 
 
 def main() -> int:
-    root = tk.Tk()
+    app_module.App._setup_tray = lambda self: False   # настоящий трей под песочницей недоступен
+    root = ctk.CTk()
     instance = app_module.App(root)
     instance.start_hidden = True
 
