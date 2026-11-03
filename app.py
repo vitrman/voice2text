@@ -14,18 +14,21 @@ import time
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
 import autostart
 from asr_engine import GigaAMEngine
+import call_transcribe
+import calls
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
 import history
 import hotkey_capture
 from hotkeys import HOTKEYS, parse_hotkey, probe_hotkey
 from jobs import TranscriptionQueue
+import loopback
 from postprocess import apply_replacements, drop_fillers, tidy
 from recorder import MicRecorder, RecorderError, RecordingStopped
 from theme import (ACCENT, ACCENT_HOVER, BG, BORDER, CARD, CARD_HOVER, MUTED,
@@ -164,23 +167,25 @@ def start_keyboard_hook() -> None:
 
 
 
-def apply_hotkey_specs(dictate: str, show: str) -> bool:
+def apply_hotkey_specs(dictate: str, show: str, call: str | None = None) -> bool:
     """Разбирает комбинации в коды WinAPI (ошибка — запасная). False — была подмена."""
-    return HOTKEYS.configure(dictate, show)
+    return HOTKEYS.configure(dictate, show, call)
 
 
-def set_hotkeys(dictate: str, show: str) -> None:
+def set_hotkeys(dictate: str, show: str, call: str | None = None) -> None:
     """Обновляет комбинации и просит поток слушателя перерегистрировать их."""
-    apply_hotkey_specs(dictate, show)
+    apply_hotkey_specs(dictate, show, call)
     if HOTKEY_TID["tid"]:
         USER32.PostThreadMessageW(HOTKEY_TID["tid"], WM_RELOAD_HOTKEYS, 0, 0)
 
 
-def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thread:
-    """Глобальные горячие клавиши: диктовка и показ окна."""
+def start_hotkey_listener(on_dictate, on_show, on_status=None, on_call=None) -> threading.Thread:
+    """Глобальные горячие клавиши: диктовка, показ окна и созвон."""
+
+    ids = ((1, "dictate"), (2, "show"), (3, "call"))
 
     def register() -> None:
-        for hotkey_id, name in ((1, "dictate"), (2, "show")):
+        for hotkey_id, name in ids:
             registered = None
             for combo in HOTKEYS.candidates(name):
                 mods, vk = parse_hotkey(combo)
@@ -202,7 +207,7 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
 
     def retry_requested() -> None:
         """Пробует вернуть желаемую комбинацию: помешавшая программа могла закрыться."""
-        for hotkey_id, name in ((1, "dictate"), (2, "show")):
+        for hotkey_id, name in ids:
             requested = HOTKEYS.requested(name)
             previous = HOTKEYS.actual(name)
             if previous == requested or not probe_hotkey(requested):
@@ -242,14 +247,17 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None) -> threading.Thre
                 elif msg.wParam == 2:
                     trace("hotkey: показать окно")
                     on_show()
+                elif msg.wParam == 3 and on_call is not None:
+                    trace("hotkey: созвон")
+                    on_call()
             elif msg.message == WM_RELOAD_HOTKEYS:
-                USER32.UnregisterHotKey(None, 1)
-                USER32.UnregisterHotKey(None, 2)
+                for hotkey_id, _name in ids:
+                    USER32.UnregisterHotKey(None, hotkey_id)
                 register()
             elif msg.message == WM_RETRY_HOTKEYS:
                 retry_requested()
-        USER32.UnregisterHotKey(None, 1)
-        USER32.UnregisterHotKey(None, 2)
+        for hotkey_id, _name in ids:
+            USER32.UnregisterHotKey(None, hotkey_id)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -305,6 +313,87 @@ class UpdateDialog(ctk.CTkToplevel):
             self.destroy()
 
 
+class CallProgressDialog(ctk.CTkToplevel):
+    """Ход пакетной расшифровки созвона: прогресс и кнопка «Отмена»."""
+
+    def __init__(self, master, session_name: str, on_cancel) -> None:
+        super().__init__(master)
+        self.title("Расшифровка созвона")
+        self.geometry("430x170")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.attributes("-topmost", True)
+        self._on_cancel = on_cancel
+        self._closed = False
+
+        ctk.CTkLabel(self, text=f"Расшифровываю созвон {session_name}", anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 14, "bold")).pack(
+            fill="x", padx=20, pady=(18, 4))
+        self.info = ctk.CTkLabel(self, text="готовлю реплики…", anchor="w", text_color=MUTED,
+                                 font=ctk.CTkFont("Segoe UI", 12))
+        self.info.pack(fill="x", padx=20)
+        self.bar = ctk.CTkProgressBar(self, height=10, corner_radius=5,
+                                      progress_color=ACCENT, fg_color=CARD_HOVER)
+        self.bar.set(0)
+        self.bar.pack(fill="x", padx=20, pady=12)
+        ctk.CTkButton(self, text="Отмена", width=120, height=32, corner_radius=9,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      text_color=TEXT, hover_color=CARD,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self._cancel).pack(anchor="e", padx=20, pady=(0, 14))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.after(50, self.lift)
+
+    def set_progress(self, done: int, total: int) -> None:
+        if self._closed or not total:
+            return
+        self.bar.set(min(1.0, done / total))
+        self.info.configure(text=f"{done} из {total} реплик")
+
+    def _cancel(self) -> None:
+        self._closed = True
+        try:
+            self._on_cancel()
+        finally:
+            self.destroy()
+
+
+class CallResultDialog(ctk.CTkToplevel):
+    """Созвон расшифрован: открыть папку или сохранить копию."""
+
+    def __init__(self, master, session, count: int, on_save, on_open) -> None:
+        super().__init__(master)
+        self.title("Созвон расшифрован")
+        self.geometry("520x210")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.attributes("-topmost", True)
+
+        ctk.CTkLabel(self, text=f"Готово: {count} реплик", anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 15, "bold")).pack(
+            fill="x", padx=20, pady=(18, 4))
+        ctk.CTkLabel(self, text=f"Файл: {session / calls.TRANSCRIPT_FILE}", anchor="w",
+                     justify="left", wraplength=470, text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 11)).pack(fill="x", padx=20)
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.pack(fill="x", padx=20, pady=18)
+        ctk.CTkButton(buttons, text="Сохранить копию…", height=34, width=170, corner_radius=9,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                      command=lambda: (on_save(), self.destroy())).pack(side="left")
+        ctk.CTkButton(buttons, text="Открыть папку", height=34, width=150, corner_radius=9,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      text_color=TEXT, hover_color=CARD_HOVER,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=lambda: (on_open(), self.destroy())).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(buttons, text="Закрыть", height=34, width=110, corner_radius=9,
+                      fg_color="transparent", border_width=1, border_color=BORDER,
+                      text_color=TEXT, hover_color=CARD_HOVER,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self.destroy).pack(side="right")
+
+
 class App:
     def __init__(self, root: tk.Tk, config: Config | None = None):
         self.root = root
@@ -345,6 +434,15 @@ class App:
         self._update_dialog = None
         self._pending_model = None    # смена модели ждёт окончания распознавания
         self._wizard = None
+        # созвон
+        self.call_active = False
+        self.call_session = None
+        self.call_stop = None
+        self.call_started = 0.0
+        self.call_threads: list = []
+        self._call_timer_after = None
+        self._call_cancel = None
+        self._call_dialog = None
         LOG.parent.mkdir(exist_ok=True)
         LOG.write_text(f"=== старт {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n", encoding="utf-8")
         self._log_environment()
@@ -357,17 +455,20 @@ class App:
         self._build_overlay()
         try:
             apply_hotkey_specs(self.config.get("hotkey") or "",
-                               self.config.get("show_hotkey") or "")
+                               self.config.get("show_hotkey") or "",
+                               self.config.get("call_hotkey") or "")
         except ValueError as exc:
             trace(f"hotkey: настройки некорректны ({exc}), оставляю умолчания")
         start_hotkey_listener(lambda: self._hotkey_event("hotkey"),
                               lambda: self._hotkey_event("show"),
-                              lambda name, combo: self.events.put(("hotkey_changed", (name, combo))))
+                              lambda name, combo: self.events.put(("hotkey_changed", (name, combo))),
+                              on_call=lambda: self._hotkey_event("call"))
         start_keyboard_hook()
         self._setup_tray()
         self._warn_missing_device()
         if not self.config.get("first_run_done"):
             self.root.after(700, self._maybe_first_run)
+        self.root.after(2000, self._maybe_resume_calls)
         if self.config.get("check_updates", True):
             self.root.after(15000, self._auto_update_check)
 
@@ -554,10 +655,18 @@ class App:
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(0, weight=1)
 
-        left = ctk.CTkFrame(main, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+        self.tabs = ctk.CTkTabview(
+            main, fg_color="transparent", corner_radius=16,
+            segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=CARD,
+            segmented_button_unselected_hover_color=CARD_HOVER,
+            segmented_button_fg_color=CARD, text_color=TEXT)
+        self.tabs.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+        dict_tab = self.tabs.add("Диктовка")
+        call_tab = self.tabs.add("Созвон")
 
-        header = ctk.CTkFrame(left, fg_color="transparent")
+        header = ctk.CTkFrame(dict_tab, fg_color="transparent")
         header.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(header, text="Голосовой ввод",
                      font=ctk.CTkFont("Segoe UI", 20, "bold")).pack(side="left")
@@ -574,7 +683,7 @@ class App:
                                        command=self.clear_text)
         self.btn_clear.pack(side="right", padx=(0, 8))
 
-        card = ctk.CTkFrame(left, corner_radius=16, fg_color=CARD)
+        card = ctk.CTkFrame(dict_tab, corner_radius=16, fg_color=CARD)
         card.pack(fill="x", pady=(0, 10))
 
         self.btn_record = ctk.CTkButton(card, text=self._record_button_text(), height=46,
@@ -594,13 +703,15 @@ class App:
                       command=self._schedule_apply).pack(side="left", padx=(14, 16))
 
         self.status = tk.StringVar(value="Загрузка модели…")
-        ctk.CTkLabel(left, textvariable=self.status, text_color=MUTED, anchor="w",
+        ctk.CTkLabel(dict_tab, textvariable=self.status, text_color=MUTED, anchor="w",
                      font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", pady=(0, 8))
 
-        self.text = ctk.CTkTextbox(left, wrap="word", corner_radius=14,
+        self.text = ctk.CTkTextbox(dict_tab, wrap="word", corner_radius=14,
                                    fg_color=CARD, border_width=1, border_color=BORDER,
                                    text_color=TEXT, font=ctk.CTkFont("Segoe UI", 15))
         self.text.pack(fill="both", expand=True)
+
+        self._build_call_tab(call_tab)
 
         self.settings_panel = ctk.CTkScrollableFrame(main, width=372, corner_radius=16,
                                                      fg_color=CARD)
@@ -610,6 +721,62 @@ class App:
         self.root.bind("<space>", self._on_space)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._remember_own_hwnd)
+
+    # ---------- вкладка созвона ----------
+    def _build_call_tab(self, tab) -> None:
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 12))
+        self.call_button = ctk.CTkButton(top, text="● Начать созвон", height=46, width=210,
+                                         corner_radius=12, fg_color=ACCENT,
+                                         hover_color=ACCENT_HOVER,
+                                         font=ctk.CTkFont("Segoe UI", 15, "bold"),
+                                         command=self.toggle_call)
+        self.call_button.pack(side="left")
+        self.call_timer = ctk.CTkLabel(top, text="00:00", text_color=TEXT,
+                                       font=ctk.CTkFont("Segoe UI", 22, "bold"))
+        self.call_timer.pack(side="left", padx=(18, 12))
+        self.call_hint = ctk.CTkLabel(top, text=f"хоткей: {HOTKEYS.shown('call')}",
+                                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 12))
+        self.call_hint.pack(side="left")
+
+        levels = ctk.CTkFrame(tab, corner_radius=16, fg_color=CARD)
+        levels.pack(fill="x", pady=(0, 12))
+        self.call_levels = {}
+        for name, title in (("mic", "микрофон"), ("system", "системный звук")):
+            row = ctk.CTkFrame(levels, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=(10, 4))
+            ctk.CTkLabel(row, text=title, width=140, anchor="w", text_color=MUTED,
+                         font=ctk.CTkFont("Segoe UI", 12)).pack(side="left")
+            bar = ctk.CTkProgressBar(row, height=10, corner_radius=5,
+                                     progress_color=ACCENT, fg_color=CARD_HOVER)
+            bar.set(0)
+            bar.pack(side="left", fill="x", expand=True)
+            self.call_levels[name] = bar
+
+        self.call_status = tk.StringVar(
+            value="Готов к записи. Микрофон — ваш голос, системный звук — собеседники.\n"
+                  "Лучше в наушниках: с колонками микрофон слышит собеседника.")
+        ctk.CTkLabel(tab, textvariable=self.call_status, anchor="w", justify="left",
+                     text_color=MUTED, wraplength=680,
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(fill="x", pady=(0, 8))
+
+        self.call_log = ctk.CTkTextbox(tab, wrap="word", corner_radius=14, fg_color=CARD,
+                                       border_width=1, border_color=BORDER, text_color=TEXT,
+                                       font=ctk.CTkFont("Segoe UI", 13))
+        self.call_log.pack(fill="both", expand=True)
+
+        buttons = ctk.CTkFrame(tab, fg_color="transparent")
+        buttons.pack(fill="x", pady=(8, 0))
+        ctk.CTkButton(buttons, text="Открыть папку созвонов", height=32, width=190,
+                      corner_radius=9, fg_color="transparent", border_width=1,
+                      border_color=BORDER, text_color=TEXT, hover_color=CARD_HOVER,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self.open_calls_folder).pack(side="left")
+        ctk.CTkButton(buttons, text="Расшифровать последний", height=32, width=190,
+                      corner_radius=9, fg_color="transparent", border_width=1,
+                      border_color=BORDER, text_color=TEXT, hover_color=CARD_HOVER,
+                      font=ctk.CTkFont("Segoe UI", 12),
+                      command=self.transcribe_pending_call).pack(side="left", padx=(8, 0))
 
     # ---------- панель настроек ----------
     def _panel_label(self, text: str, top: int = 12) -> None:
@@ -674,6 +841,8 @@ class App:
         self._hotkey_row("Хоткей диктовки", self.var_hotkey, "dictate")
         self.var_show = tk.StringVar(value=self.config["show_hotkey"])
         self._hotkey_row("Хоткей окна", self.var_show, "show")
+        self.var_call_hotkey = tk.StringVar(value=self.config.get("call_hotkey") or "ctrl+shift+c")
+        self._hotkey_row("Хоткей созвона", self.var_call_hotkey, "call")
         self.hotkey_note = self._panel_hint(
             "Ctrl/Shift/Alt + клавиша. Win и одиночные клавиши не поддерживаются.")
 
@@ -922,7 +1091,8 @@ class App:
         self._apply_after = None
         dict_combo = self.var_hotkey.get().strip().lower()
         show_combo = self.var_show.get().strip().lower()
-        for combo in (dict_combo, show_combo):
+        call_combo = self.var_call_hotkey.get().strip().lower()
+        for combo in (dict_combo, show_combo, call_combo):
             try:
                 parse_hotkey(combo)
             except ValueError as exc:
@@ -942,6 +1112,7 @@ class App:
             "device": device,
             "hotkey": dict_combo,
             "show_hotkey": show_combo,
+            "call_hotkey": call_combo,
             "hotkey_mode": "hold" if self.var_mode.get() == "удерживать" else "toggle",
             "silence_ms": silence,
             "auto_stop": bool(self.var_auto_stop.get()),
@@ -954,14 +1125,17 @@ class App:
             return
 
         old_model = self.config["model"]
-        old_hotkey = (self.config["hotkey"], self.config["show_hotkey"])
+        old_hotkey = (self.config["hotkey"], self.config["show_hotkey"],
+                      self.config.get("call_hotkey"))
         self._applying = True
         try:
             self.config.update(values)
             self.config.save()
             self.recorder.device = self.config.get("device")
-            if (self.config["hotkey"], self.config["show_hotkey"]) != old_hotkey:
-                set_hotkeys(self.config["hotkey"], self.config["show_hotkey"])
+            if (self.config["hotkey"], self.config["show_hotkey"],
+                    self.config.get("call_hotkey")) != old_hotkey:
+                set_hotkeys(self.config["hotkey"], self.config["show_hotkey"],
+                            self.config.get("call_hotkey"))
                 self._refresh_record_button()
             if self.config["model"] != old_model:
                 # смена модели только в простое: иначе в памяти живут два чекпойнта
@@ -1012,6 +1186,8 @@ class App:
         menu = pystray.Menu(
             pystray.MenuItem("Показать окно", lambda: self.events.put(("show", None)), default=True),
             pystray.MenuItem("Записать / Стоп", lambda: self.events.put(("toggle", None))),
+            pystray.MenuItem("Созвон: начать / завершить",
+                             lambda: self.events.put(("call", None))),
             pystray.MenuItem("Спрятать в трей", lambda: self.events.put(("hide_tray", None))),
             pystray.MenuItem("Выход", lambda: self.events.put(("quit", None))),
         )
@@ -1183,6 +1359,8 @@ class App:
         file_menu.add_command(label="Повторить последнюю запись", command=self.retry_last)
         file_menu.add_command(label="Отменить распознавание", command=self.cancel_recognition)
         file_menu.add_separator()
+        file_menu.add_command(label="Начать / завершить созвон", command=self.toggle_call)
+        file_menu.add_separator()
         file_menu.add_command(label="Свернуть", command=self.hide_to_tray)
         file_menu.add_command(label="Выход", command=self._quit)
         menubar.add_cascade(label="Файл", menu=file_menu)
@@ -1239,6 +1417,12 @@ class App:
                 trace(f"микрофоны ({len(devices)}): {'; '.join(devices) or 'нет'}")
             except Exception as exc:
                 trace(f"список микрофонов недоступен: {exc!r}")
+            try:
+                available = loopback.available()
+                trace(f"системный звук: {'есть' if available else 'нет'}"
+                      f" ({loopback.device_name() or 'устройство не определено'})")
+            except Exception as exc:
+                trace(f"системный звук: ошибка {exc!r}")
         except Exception:
             trace_exc("не удалось записать паспорт окружения")
 
@@ -1389,6 +1573,10 @@ class App:
         """Старт записи. Распознавание предыдущей фразы не мешает — оно в очереди."""
         if self.recording:
             return
+        if self.call_active:
+            # микрофон занят созвоном: две записи одновременно невозможны
+            self.status.set("Идёт созвон — диктовка недоступна")
+            return
         if not self._disk_ready():
             return
         self._remember_target()
@@ -1516,6 +1704,239 @@ class App:
         self._overlay_show("Распознавание отменено", "#e0a33a", 2000)
         self.status.set(f"Распознавание отменено (снято задач: {dropped})")
 
+    # ---------- режим созвона ----------
+    def toggle_call(self) -> None:
+        if self.call_active:
+            self._stop_call()
+        else:
+            self._start_call()
+
+    def _start_call(self) -> None:
+        """Начинает запись двух дорожек. Без системного звука не стартуем."""
+        if self.call_active or self.recording:
+            return
+        if not loopback.available():
+            trace("созвон: системный звук недоступен")
+            messagebox.showerror(
+                "Созвон",
+                "Не удалось открыть системный звук (WASAPI loopback).\n\n"
+                "Созвон не начат, чтобы не потерять голоса собеседников.\n"
+                "Проверьте устройство вывода и повторите.",
+                parent=self.root)
+            return
+
+        session = calls.new_session()
+        self.call_session = session
+        self.call_stop = threading.Event()
+        self.call_active = True
+        self.call_started = time.monotonic()
+        self.call_threads = []
+        now = dt.datetime.now()
+        meta = {
+            "started_local": now.strftime("%d.%m.%Y %H:%M"),
+            "started_iso": now.isoformat(timespec="seconds"),
+            "mic_device": self._device_label(),
+            "system_device": loopback.device_name(),
+            "model": self.config.get("model"),
+            "version": VERSION,
+        }
+        calls.write_meta(session, meta)
+        calls.write_state(session, {"status": "recording", "segments": [], "error": ""})
+        self.tabs.set("Созвон")
+        self.call_log.delete("1.0", "end")
+        self._call_log(f"Запись: {session.name}")
+        self._call_log(f"Микрофон: {meta['mic_device']}")
+        self._call_log(f"Системный звук: {meta['system_device']}")
+        self._set_call_state(True)
+        self.call_threads = [
+            self._call_thread(self._record_call_mic, session),
+            self._call_thread(self._record_call_system, session),
+        ]
+        self._call_tick()
+
+    def _call_thread(self, target, *args) -> threading.Thread:
+        def runner() -> None:
+            try:
+                target(*args)
+            except BaseException as exc:      # noqa: BLE001 — сообщаем о любом сбое
+                trace_exc(f"созвон: {getattr(target, '__name__', 'поток')}")
+                self.events.put(("call_error", str(exc)))
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        return thread
+
+    def _record_call_mic(self, session) -> None:
+        _path, rate = self.recorder.record_continuous(
+            session / calls.MIC_FILE, stop_event=self.call_stop,
+            on_level=lambda db: self.events.put(("call_level", ("mic", db))))
+        calls.update_meta(session, {"mic_rate": rate})
+
+    def _record_call_system(self, session) -> None:
+        recorder = loopback.SystemRecorder(log=lambda message: trace(f"созвон: {message}"))
+        recorder.record_to_file(session / calls.SYSTEM_FILE, stop_event=self.call_stop,
+                                on_level=lambda db: self.events.put(("call_level", ("system", db))))
+
+    def _stop_call(self) -> None:
+        if not self.call_active:
+            return
+        self.call_stop.set()
+        self.call_active = False
+        duration = time.monotonic() - self.call_started
+        self._set_call_state(False)
+        session = self.call_session
+        try:
+            calls.update_meta(session, {
+                "duration": round(duration, 1),
+                "ended_iso": dt.datetime.now().isoformat(timespec="seconds"),
+            })
+        except OSError:
+            pass
+        self._call_log(f"Запись остановлена: {calls.format_time(duration)}")
+        self.call_status.set("Запись остановлена. Расшифровываю…")
+        threading.Thread(target=self._finish_call_recording, args=(session,),
+                         daemon=True).start()
+
+    def _finish_call_recording(self, session) -> None:
+        """Ждёт закрытия дорожек и передаёт созвон на расшифровку."""
+        for thread in self.call_threads:
+            thread.join(timeout=8.0)
+        self.events.put(("call_recorded", session))
+
+    def _start_call_transcription(self, session) -> None:
+        if self._call_cancel is not None:
+            return
+        self._call_cancel = threading.Event()
+        self._call_dialog = CallProgressDialog(self.root, session.name,
+                                               self._cancel_call_transcription)
+        self.call_status.set("Расшифровка созвона…")
+        threading.Thread(target=self._transcribe_call, args=(session,), daemon=True).start()
+
+    def _transcribe_call(self, session) -> None:
+        def progress(done: int, total: int) -> None:
+            self.events.put(("call_progress", (done, total)))
+
+        try:
+            state = call_transcribe.transcribe_session(
+                session, self.engine, cancel=self._call_cancel, progress=progress,
+                log=lambda message: trace(f"созвон: {message}"))
+        except call_transcribe.CallCancelled:
+            self.events.put(("call_cancelled", session))
+            return
+        except Exception as exc:
+            trace_exc("созвон: расшифровка")
+            self.events.put(("call_failed", (str(exc), session)))
+            return
+        count = len([item for item in state.get("segments") or [] if item.get("text")])
+        self.events.put(("call_done", (session, count)))
+
+    def _cancel_call_transcription(self) -> None:
+        if self._call_cancel is not None:
+            self._call_cancel.set()
+            trace("созвон: отмена расшифровки")
+
+    def _close_call_dialog(self) -> None:
+        if self._call_dialog is not None:
+            try:
+                self._call_dialog.destroy()
+            except Exception:
+                pass
+            self._call_dialog = None
+        self._call_cancel = None
+
+    def _call_tick(self) -> None:
+        if not self.call_active:
+            return
+        seconds = int(time.monotonic() - self.call_started)
+        self.call_timer.configure(text=calls.format_time(seconds))
+        self._call_timer_after = self.root.after(1000, self._call_tick)
+
+    def _set_call_state(self, active: bool) -> None:
+        self.call_button.configure(
+            text="■ Завершить созвон" if active else "● Начать созвон",
+            fg_color=RECORD if active else ACCENT,
+            hover_color=RECORD_HOVER if active else ACCENT_HOVER)
+        self.btn_record.configure(state="disabled" if active else "normal")
+        if not active:
+            if self._call_timer_after is not None:
+                try:
+                    self.root.after_cancel(self._call_timer_after)
+                except Exception:
+                    pass
+                self._call_timer_after = None
+            for bar in self.call_levels.values():
+                bar.set(0)
+        self.call_hint.configure(
+            text="идёт запись — диктовка недоступна" if active
+            else f"хоткей: {HOTKEYS.shown('call')}")
+
+    def _call_log(self, text: str) -> None:
+        self.call_log.insert("end", text + "\n")
+        self.call_log.see("end")
+
+    def open_calls_folder(self, session=None) -> None:
+        try:
+            os.startfile(str(session or calls.calls_dir()))
+        except OSError as exc:
+            self.status.set(f"Не удалось открыть папку: {exc}")
+
+    def transcribe_pending_call(self) -> None:
+        if self.call_active:
+            self.call_status.set("Сначала завершите текущий созвон")
+            return
+        pending = calls.pending_sessions()
+        if not pending:
+            self.call_status.set("Нет нерасшифрованных созвонов")
+            return
+        self._start_call_transcription(pending[0])
+
+    def _maybe_resume_calls(self) -> None:
+        if self.quitting:
+            return
+        pending = calls.pending_sessions()
+        if not pending:
+            return
+        session = pending[0]
+        trace(f"созвон: найден нерасшифрованный {session.name}")
+        if messagebox.askyesno(
+                "Созвон",
+                f"Найден нерасшифрованный созвон ({session.name}).\nРасшифровать сейчас?",
+                parent=self.root):
+            self._start_call_transcription(session)
+
+    def _save_call_copy(self, session) -> None:
+        source = session / calls.TRANSCRIPT_FILE
+        if not source.exists():
+            return
+        target = filedialog.asksaveasfilename(
+            title="Сохранить расшифровку",
+            initialdir=str(calls.calls_dir()),
+            initialfile=f"созвон-{session.name}.md",
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Текст", "*.txt")])
+        if not target:
+            return
+        try:
+            shutil.copyfile(source, target)
+            self.call_status.set(f"Сохранено: {target}")
+        except OSError as exc:
+            self.call_status.set(f"Не удалось сохранить: {exc}")
+
+    def _show_call_result(self, session, count: int) -> None:
+        CallResultDialog(self.root, session, count,
+                         on_save=lambda: self._save_call_copy(session),
+                         on_open=lambda: self.open_calls_folder(session))
+
+    def _on_call_error(self, message: str) -> None:
+        if self.call_active:
+            self.call_stop.set()
+            self.call_active = False
+            self._set_call_state(False)
+        self.call_status.set(f"Созвон прерван: {message}")
+        self._call_log(f"Ошибка: {message}")
+        messagebox.showerror("Созвон", f"Созвон прерван:\n{message}", parent=self.root)
+
+
     def _watch_release(self, event) -> None:
         """Стоп по отпусканию клавиш фактической комбинации.
 
@@ -1616,12 +2037,41 @@ class App:
                     messagebox.showerror("Обновление",
                                          f"Не удалось скачать обновление:\n{payload}",
                                          parent=self.root)
+                elif kind == "call_level":
+                    name, db = payload
+                    bar = self.call_levels.get(name)
+                    if bar is not None:
+                        bar.set(max(0.0, min(100.0, (db + 60) * 100 / 60)) / 100)
+                elif kind == "call_error":
+                    self._on_call_error(payload)
+                elif kind == "call_recorded":
+                    self._start_call_transcription(payload)
+                elif kind == "call_progress":
+                    if self._call_dialog is not None:
+                        self._call_dialog.set_progress(*payload)
+                elif kind == "call_done":
+                    self._close_call_dialog()
+                    self.call_status.set(f"Расшифровано: {payload[1]} реплик")
+                    self._call_log(f"Расшифровано: {payload[1]} реплик")
+                    self._show_call_result(*payload)
+                elif kind == "call_cancelled":
+                    self._close_call_dialog()
+                    self.call_status.set("Расшифровка отменена — можно продолжить позже")
+                elif kind == "call_failed":
+                    message, _session = payload
+                    self._close_call_dialog()
+                    self.call_status.set(f"Не удалось расшифровать: {message}")
+                    messagebox.showerror("Созвон",
+                                         f"Расшифровка не удалась:\n{message}",
+                                         parent=self.root)
                 elif kind == "overlay":
                     self._overlay_show(*payload)
                 elif kind == "hotkey_changed":
                     self._on_hotkey_changed(*payload)
                 elif kind == "toggle":
                     self.toggle_recording()
+                elif kind == "call":
+                    self.toggle_call()
                 elif kind == "show":
                     self._show_window()
                 elif kind == "hide_tray":

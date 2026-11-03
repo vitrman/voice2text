@@ -33,6 +33,7 @@ DEFAULTS = {
     "autopaste": True,
     "hotkey": "ctrl+shift+space",
     "show_hotkey": "ctrl+shift+w",
+    "call_hotkey": "ctrl+shift+c",
     "hotkey_mode": "toggle",   # toggle = нажал/нажал, hold = держать
     "silence_ms": 700,
     "auto_stop": True,         # False — писать до кнопки «Стоп»/хоткея, паузы не режут
@@ -86,7 +87,7 @@ class Config(dict):
             config["show_hotkey"] = DEFAULTS["show_hotkey"]
             changed = True
         # одиночные клавиши и мусор больше не поддерживаются: только комбинации
-        for key in ("hotkey", "show_hotkey"):
+        for key in ("hotkey", "show_hotkey", "call_hotkey"):
             try:
                 parse_hotkey(config.get(key) or "")
             except ValueError:

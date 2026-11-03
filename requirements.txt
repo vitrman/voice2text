@@ -12,6 +12,8 @@ numpy
 scipy
 sounddevice
 soundfile
+# захват системного звука (WASAPI loopback) для режима «Созвон»
+soundcard
 tqdm
 pyyaml
 omegaconf==2.3.0

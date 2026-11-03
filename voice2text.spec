@@ -4,8 +4,10 @@
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hiddenimports = ["PIL._tkinter_finder", "pystray._win32", "uninstall",
-                 "first_run", "mic_check", "autostart", "history", "jobs", "win32"]
-for package in ("gigaam", "pystray", "hydra", "omegaconf", "sounddevice", "sentencepiece"):
+                 "first_run", "mic_check", "autostart", "history", "jobs", "win32",
+                 "calls", "call_transcribe", "loopback", "soundcard"]
+for package in ("gigaam", "pystray", "hydra", "omegaconf", "sounddevice", "sentencepiece",
+                "soundcard"):
     try:
         hiddenimports += collect_submodules(package)
     except Exception:

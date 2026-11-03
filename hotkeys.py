@@ -51,10 +51,12 @@ for _vk in range(0x41, 0x5B):          # A..Z
 # модификатор -> виртуальный код, который надо держать для режима «удерживать»
 MOD_VK = ((MOD_CONTROL, VK_CONTROL), (MOD_ALT, VK_MENU), (MOD_SHIFT, VK_SHIFT))
 
-DEFAULT_COMBOS = {"dictate": "ctrl+shift+space", "show": "ctrl+shift+w"}
+DEFAULT_COMBOS = {"dictate": "ctrl+shift+space", "show": "ctrl+shift+w",
+                  "call": "ctrl+shift+c"}
 FALLBACKS = {
     "dictate": ["ctrl+shift+space", "ctrl+shift+f9", "ctrl+alt+d"],
     "show": ["ctrl+shift+w", "ctrl+shift+f10", "ctrl+alt+o"],
+    "call": ["ctrl+shift+c", "ctrl+shift+f11", "ctrl+alt+c"],
 }
 
 
@@ -137,11 +139,14 @@ class HotkeyRegistry:
         self._specs = {name: parse_hotkey(combo) for name, combo in self._requested.items()}
         self._actual = dict(self._requested)
 
-    def configure(self, dictate: str, show: str) -> bool:
+    def configure(self, dictate: str, show: str, call: str | None = None) -> bool:
         """Применяет комбинации из настроек. False — пришлось взять запасную."""
         replaced = False
+        pairs = [("dictate", dictate), ("show", show)]
+        if call is not None:
+            pairs.append(("call", call))
         with self._lock:
-            for name, combo in (("dictate", dictate), ("show", show)):
+            for name, combo in pairs:
                 try:
                     spec = parse_hotkey(combo)
                 except ValueError:

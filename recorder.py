@@ -483,6 +483,81 @@ class MicRecorder:
             raise RecorderError("Речь не обнаружена")
         return path
 
+    def record_continuous(self, path: Path, stop_event=None, on_level=None,
+                          max_hours: float = 4.0) -> tuple[Path, int]:
+        """Пишет всё подряд без VAD — дорожка созвона. Возвращает (путь, частота).
+
+        Нарезка на реплики делается потом, по файлу: во время созвона важно ничего
+        не потерять и не занимать процессор распознаванием.
+        """
+        path = Path(path)
+        stream, sr = open_input_stream(
+            self.device, self.block_ms, self.log, timeout=self.open_timeout,
+            should_stop=(lambda: stop_event is not None and stop_event.is_set()))
+        frames_per_block = max(1, int(sr * self.block_ms / 1000))
+        limit_blocks = int(max_hours * 3600 * 1000 / self.block_ms)
+
+        audio_queue: queue.Queue = queue.Queue(maxsize=40)
+        reader_stop = threading.Event()
+
+        def pump() -> None:
+            while not reader_stop.is_set():
+                try:
+                    block, overflowed = stream.read(frames_per_block)
+                except Exception as exc:
+                    audio_queue.put(("error", exc))
+                    return
+                if reader_stop.is_set():
+                    return
+                try:
+                    audio_queue.put(("data", (block, overflowed)), timeout=0.5)
+                except queue.Full:
+                    pass
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        writer = wave.open(str(path), "wb")
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sr)
+        blocks = 0
+        lost = 0
+        last_data = time.monotonic()
+        try:
+            while blocks < limit_blocks:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    kind, payload = audio_queue.get(timeout=self.block_timeout)
+                except queue.Empty:
+                    if time.monotonic() - last_data > self.read_timeout:
+                        raise RecorderError(
+                            "Микрофон не отдаёт звук — проверьте устройство")
+                    continue
+                last_data = time.monotonic()
+                if kind == "error":
+                    raise RecorderError(f"Микрофон недоступен: {payload}")
+                block, overflowed = payload
+                blocks += 1
+                if overflowed:
+                    lost += 1
+                mono = block[:, 0] if block.ndim > 1 else block
+                writer.writeframes(_to_int16(mono).tobytes())
+                if on_level is not None:
+                    rms = float(np.sqrt(np.mean(np.asarray(mono, dtype=np.float64) ** 2)) + 1e-9)
+                    on_level(20.0 * np.log10(rms))
+        finally:
+            _shutdown_stream(stream, reader, reader_stop, log=self.log)
+            writer.close()
+
+        self.last_overflow_ms = lost * self.block_ms
+        if self.last_overflow_ms:
+            self.log(f"переполнение аудиобуфера: потеряно {self.last_overflow_ms} мс")
+        self.log(f"дорожка созвона: {path.name}, {sr} Гц, {blocks * self.block_ms / 1000:.0f} с")
+        return path, sr
+
     def _record_memory(self, *, sr: int, device_spec, silence_ms: int, start_timeout: float,
                        on_level, push_to_talk: bool, stop_event, limit_seconds: float) -> np.ndarray:
         """Запасной путь для устройств без 16 кГц: копим в памяти и ресемплируем."""
