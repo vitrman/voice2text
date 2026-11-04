@@ -45,6 +45,15 @@ def main() -> int:
     assert not hotkeys.is_disabled("ctrl+shift+w")
     assert hotkeys.normalize(hotkeys.DISABLED_LABEL) == ""
 
+    # комбинация собирается из трёх списков: модификатор, модификатор, клавиша
+    assert hotkeys.split_combo("ctrl+alt+x") == (["ctrl", "alt"], "x")
+    assert hotkeys.join_combo(["ctrl", "alt"], "x") == "ctrl+alt+x"
+    assert hotkeys.split_combo("") == ([], "")
+    for mod in hotkeys.MODIFIER_CHOICES:
+        hotkeys.parse_hotkey(f"{mod}+f1")
+    for key in hotkeys.KEY_CHOICES:
+        hotkeys.parse_hotkey(f"ctrl+alt+{key}")
+
     text = (ROOT / "version.py").read_text(encoding="utf-8")
     assert f'"{version.VERSION}"' in text
 

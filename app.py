@@ -25,8 +25,9 @@ import calls
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
 import history
-from hotkeys import (DEFAULT_COMBOS, DISABLED_LABEL, HOTKEYS, OPTIONAL_ACTIONS,
-                     hotkey_choices, is_disabled, normalize, parse_hotkey, probe_hotkey)
+from hotkeys import (DEFAULT_COMBOS, DISABLED_LABEL, HOTKEYS, KEY_CHOICES,
+                     MODIFIER_CHOICES, OPTIONAL_ACTIONS, is_disabled, join_combo,
+                     normalize, parse_hotkey, probe_hotkey, split_combo)
 from jobs import TranscriptionQueue
 import loopback
 from postprocess import apply_replacements, drop_fillers, tidy
@@ -53,6 +54,10 @@ _HOTKEY_CONFIG_KEYS = {"dictate": "hotkey", "show": "show_hotkey", "call": "call
 def hotkey_text(name: str) -> str:
     """Подпись хоткея для интерфейса: «отключён» вместо пустой строки."""
     return HOTKEYS.shown(name) or "отключён"
+
+
+# пункт списка модификаторов, означающий «второго модификатора нет»
+NO_MODIFIER = "— нет —"
 
 
 def _input_devices(all_variants: bool = False) -> list[str]:
@@ -811,16 +816,14 @@ class App:
                       font=ctk.CTkFont("Segoe UI", 12),
                       command=self._test_microphone).pack(fill="x", padx=16, pady=(4, 4))
 
-        self._hotkey_entries: dict[str, object] = {}
-        self._hotkey_choices = hotkey_choices()
-        self.var_hotkey = tk.StringVar(value=self._hotkey_display("dictate"))
-        self._hotkey_menu("Хоткей диктовки", self.var_hotkey, "dictate")
-        self.var_show = tk.StringVar(value=self._hotkey_display("show"))
-        self._hotkey_menu("Хоткей окна", self.var_show, "show")
-        self.var_call_hotkey = tk.StringVar(value=self._hotkey_display("call"))
-        self._hotkey_menu("Хоткей созвона", self.var_call_hotkey, "call")
+        self._hotkey_entries: dict[str, list] = {}
+        self._hotkey_vars: dict[str, tuple] = {}
+        self._hotkey_menu("Хоткей диктовки", "dictate")
+        self._hotkey_menu("Хоткей окна", "show")
+        self._hotkey_menu("Хоткей созвона", "call")
         self.hotkey_note = self._panel_hint(
-            "Выберите комбинацию из списка. Окно и созвон можно отключить.")
+            "Комбинация собирается из трёх списков: Ctrl, Alt и клавиша. "
+            "Окно и созвон можно отключить.")
 
         self._panel_label("Режим хоткея")
         self.var_mode = tk.StringVar(value="удерживать" if self.config.get("hotkey_mode") == "hold"
@@ -961,47 +964,89 @@ class App:
             return value
         return DEFAULT_COMBOS[name] if name == "dictate" else ""
 
-    def _hotkey_display(self, name: str) -> str:
-        """Что показывать в списке: комбинация или пункт «отключена»."""
-        return self._hotkey_value(name) or DISABLED_LABEL
+    def _hotkey_menu(self, title: str, name: str) -> None:
+        """Три отдельных списка вместо одной длинной комбинации.
 
-    def _hotkey_menu(self, title: str, var: tk.StringVar, name: str) -> None:
-        """Выпадающий список вместо свободного ввода и захвата клавиш хуком."""
+        Раньше «ctrl+alt+x» выбирался одним пунктом из ~80 — нужный приходилось
+        искать глазами. Теперь части собираются по одной: модификатор, второй
+        модификатор (может быть «нет») и клавиша.
+        """
         self._panel_label(title)
-        choices = list(self._hotkey_choices)
-        if name in OPTIONAL_ACTIONS:
-            choices.insert(0, DISABLED_LABEL)   # «хоткея нет» — только для окна и созвона
-        if var.get() and var.get() not in choices:
-            choices.append(var.get())          # текущее значение всегда доступно
-        box = ctk.CTkComboBox(self.settings_panel, values=choices, variable=var,
-                              state="readonly", corner_radius=10, fg_color=BG,
-                              border_color=BORDER, button_color=BORDER,
-                              button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
-                              command=lambda combo, n=name, v=var: self._on_hotkey_pick(n, v, combo),
-                              font=ctk.CTkFont("Segoe UI", 12))
-        box.pack(fill="x", padx=16, pady=(0, 4))
-        self._hotkey_entries[name] = box
+        mods, key = split_combo(self._hotkey_value(name))
+        optional = name in OPTIONAL_ACTIONS
+        key_values = list(KEY_CHOICES)
+        if optional:
+            key_values.insert(0, DISABLED_LABEL)      # «хоткея нет» — окно и созвон
+        if key and key not in key_values:
+            key_values.append(key)                    # старое значение всегда доступно
+        mod_values = [NO_MODIFIER, *MODIFIER_CHOICES]
 
-    def _on_hotkey_pick(self, name: str, var: tk.StringVar, combo: str) -> None:
-        combo = normalize(combo)
-        if not combo:
-            if name not in OPTIONAL_ACTIONS:      # диктовку отключить нельзя
-                var.set(self._hotkey_display(name))
-                self._hotkey_note_error("Без хоткея диктовки программой не управлять")
-                return
+        row = ctk.CTkFrame(self.settings_panel, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 4))
+        var_m1 = tk.StringVar(value=mods[0] if mods else NO_MODIFIER)
+        var_m2 = tk.StringVar(value=mods[1] if len(mods) > 1 else NO_MODIFIER)
+        var_key = tk.StringVar(value=key or (DISABLED_LABEL if optional else KEY_CHOICES[0]))
+        widgets = []
+        for values, var, width in ((mod_values, var_m1, 94), (mod_values, var_m2, 94),
+                                   (key_values, var_key, 118)):
+            box = ctk.CTkComboBox(row, values=values, variable=var, width=width,
+                                  state="readonly", corner_radius=10, fg_color=BG,
+                                  border_color=BORDER, button_color=BORDER,
+                                  button_hover_color=CARD_HOVER, dropdown_fg_color=BG,
+                                  command=lambda _v, n=name: self._on_hotkey_change(n),
+                                  font=ctk.CTkFont("Segoe UI", 12))
+            box.pack(side="left", padx=(0, 6))
+            widgets.append(box)
+        self._hotkey_entries[name] = widgets
+        self._hotkey_vars[name] = (var_m1, var_m2, var_key)
+
+    def _hotkey_parts(self, name: str) -> tuple[list[str], str]:
+        var_m1, var_m2, var_key = self._hotkey_vars[name]
+        mods = [var.get() for var in (var_m1, var_m2) if var.get() != NO_MODIFIER]
+        return mods, var_key.get()
+
+    def _hotkey_combo(self, name: str) -> str:
+        """Комбинация из трёх списков; пустая строка — действие отключено."""
+        mods, key = self._hotkey_parts(name)
+        if is_disabled(key) and name in OPTIONAL_ACTIONS:
+            return ""
+        return join_combo(mods, key)
+
+    def _hotkey_fill(self, name: str) -> None:
+        """Возвращает списки к сохранённому значению после недопустимого выбора."""
+        mods, key = split_combo(self._hotkey_value(name))
+        var_m1, var_m2, var_key = self._hotkey_vars[name]
+        var_m1.set(mods[0] if mods else NO_MODIFIER)
+        var_m2.set(mods[1] if len(mods) > 1 else NO_MODIFIER)
+        var_key.set(key or (DISABLED_LABEL if name in OPTIONAL_ACTIONS else KEY_CHOICES[0]))
+
+    def _on_hotkey_change(self, name: str) -> None:
+        mods, key = self._hotkey_parts(name)
+        if name in OPTIONAL_ACTIONS and is_disabled(key):
             self.hotkey_note.configure(text="Хоткей отключён", text_color=MUTED)
             self.status.set("Хоткей отключён")
             self._schedule_apply()
             return
+        if not mods:
+            self.hotkey_note.configure(
+                text="Выберите модификатор: Ctrl, Alt или Shift", text_color=MUTED)
+            return
+        if len(set(mods)) != len(mods):
+            # не сбрасываем весь выбор: убираем только повтор во втором списке
+            self._hotkey_vars[name][1].set(NO_MODIFIER)
+            self.hotkey_note.configure(text="Повтор модификатора убран", text_color=MUTED)
+            self._on_hotkey_change(name)
+            return
+        combo = join_combo(mods, key)
         try:
             parse_hotkey(combo)
         except ValueError as exc:
-            var.set(self._hotkey_display(name))
+            self._hotkey_fill(name)
             self._hotkey_note_error(f"Недопустимая комбинация: {exc}")
             return
         conflict = self._hotkey_conflict(name, combo)
         if conflict:
-            var.set(self._hotkey_display(name))
+            self._hotkey_fill(name)
             self._hotkey_note_error(conflict)
             return
         self.hotkey_note.configure(text=f"Хоткей {combo} будет применён", text_color=MUTED)
@@ -1033,29 +1078,30 @@ class App:
         и рамка показывают, что реально работает сейчас.
         """
         requested = HOTKEYS.requested(name)
-        entry = self._hotkey_entries.get(name)
+        widgets = self._hotkey_entries.get(name) or []
+
+        def mark(color: str) -> None:
+            for box in widgets:
+                box.configure(border_color=color)
+
         if not requested:
-            if entry is not None:
-                entry.configure(border_color=BORDER)
+            mark(BORDER)
             self.hotkey_note.configure(text="Хоткей отключён", text_color=MUTED)
             self.status.set("Хоткей отключён")
         elif combo is None:
-            if entry is not None:
-                entry.configure(border_color="#e0554f")
+            mark("#e0554f")
             self.hotkey_note.configure(text=f"Не удалось назначить {requested}",
                                        text_color="#e0554f")
             self.status.set(f"Хоткей {requested} не назначен")
         elif combo != requested:
-            if entry is not None:
-                entry.configure(border_color="#e0a33a")
+            mark("#e0a33a")
             self.hotkey_note.configure(
                 text=f"{requested} занята другой программой — сейчас работает {combo}. "
                      f"Попробую вернуть автоматически.",
                 text_color="#e0a33a")
             self.status.set(f"{requested} занята — работает {combo}")
         else:
-            if entry is not None:
-                entry.configure(border_color=BORDER)
+            mark(BORDER)
             self.hotkey_note.configure(text=f"Хоткей {combo} работает", text_color="#4caf68")
             self.status.set(f"Хоткей {combo} снова работает")
         self._refresh_record_button()
@@ -1070,9 +1116,9 @@ class App:
 
     def _apply_settings(self) -> None:
         self._apply_after = None
-        dict_combo = normalize(self.var_hotkey.get())
-        show_combo = normalize(self.var_show.get())
-        call_combo = normalize(self.var_call_hotkey.get())
+        dict_combo = self._hotkey_combo("dictate")
+        show_combo = self._hotkey_combo("show")
+        call_combo = self._hotkey_combo("call")
         for name, combo in (("dictate", dict_combo), ("show", show_combo), ("call", call_combo)):
             if not combo and name in OPTIONAL_ACTIONS:
                 continue                        # отключённый хоткей — допустимое значение

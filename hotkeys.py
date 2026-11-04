@@ -76,6 +76,31 @@ def normalize(text) -> str:
     return "" if value == DISABLED_LABEL else value
 
 
+MODIFIER_CHOICES = ("ctrl", "alt", "shift")
+KEY_CHOICES = (
+    *[f"f{i}" for i in range(1, 13)],
+    "space", "enter",
+    *list("abcdefghijklmnopqrstuvwxyz"),
+)
+
+
+def split_combo(text) -> tuple[list[str], str]:
+    """«ctrl+alt+x» -> (["ctrl", "alt"], "x"). Пустая комбинация -> ([], "")."""
+    parts = [part.strip().lower() for part in normalize(text).split("+") if part.strip()]
+    if not parts:
+        return [], ""
+    return parts[:-1], parts[-1]
+
+
+def join_combo(mods, key) -> str:
+    """Обратное к split_combo: модификаторы и клавиша -> строка настройки."""
+    parts = [str(mod).strip().lower() for mod in mods if str(mod).strip()]
+    key = str(key or "").strip().lower()
+    if key:
+        parts.append(key)
+    return "+".join(parts)
+
+
 def hotkey_choices() -> list[str]:
     """Комбинации для выпадающего меню настроек — без свободного ввода с клавиатуры.
 
