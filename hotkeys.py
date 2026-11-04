@@ -59,6 +59,22 @@ FALLBACKS = {
     "call": ["ctrl+shift+c", "ctrl+shift+f11", "ctrl+alt+c"],
 }
 
+# действия, которые можно отключить: пустая комбинация = «хоткея нет»
+OPTIONAL_ACTIONS = ("show", "call")
+DISABLED_LABEL = "— отключена —"
+
+
+def is_disabled(text) -> bool:
+    """Пустая комбинация или пункт меню «отключена» значат «действие без хоткея»."""
+    value = str(text or "").strip().lower()
+    return not value or value == DISABLED_LABEL
+
+
+def normalize(text) -> str:
+    """Комбинация из настроек: пустая строка остаётся пустой, остальное — в нижний регистр."""
+    value = str(text or "").strip().lower()
+    return "" if value == DISABLED_LABEL else value
+
 
 def hotkey_choices() -> list[str]:
     """Комбинации для выпадающего меню настроек — без свободного ввода с клавиатуры.
@@ -164,13 +180,23 @@ class HotkeyRegistry:
         self._actual = dict(self._requested)
 
     def configure(self, dictate: str, show: str, call: str | None = None) -> bool:
-        """Применяет комбинации из настроек. False — пришлось взять запасную."""
+        """Применяет комбинации из настроек. False — пришлось взять запасную.
+
+        Пустая комбинация у необязательного действия — это не ошибка, а «хоткея нет»:
+        диктовка обязательна, окно и созвон можно отключить.
+        """
         replaced = False
         pairs = [("dictate", dictate), ("show", show)]
         if call is not None:
             pairs.append(("call", call))
         with self._lock:
-            for name, combo in pairs:
+            for name, value in pairs:
+                combo = normalize(value)
+                if not combo and name in OPTIONAL_ACTIONS:
+                    self._requested[name] = ""
+                    self._specs[name] = None
+                    self._actual[name] = ""      # регистрацию снимает слушатель хоткеев
+                    continue
                 try:
                     spec = parse_hotkey(combo)
                 except ValueError:
@@ -201,21 +227,25 @@ class HotkeyRegistry:
         with self._lock:
             return dict(self._actual)
 
-    def spec(self, name: str) -> tuple[int, int]:
+    def spec(self, name: str) -> tuple[int, int] | None:
+        """Коды WinAPI или None, если действие отключено."""
         with self._lock:
             return self._specs[name]
 
     def candidates(self, name: str) -> list[str]:
-        """Запрошенная комбинация и запасные к ней."""
+        """Запрошенная комбинация и запасные к ней; пусто — действие отключено."""
         requested = self.requested(name)
+        if not requested:
+            return []
         return [requested] + [combo for combo in FALLBACKS[name] if combo != requested]
 
     def keys(self, name: str) -> list[int]:
         """Клавиши фактически работающей комбинации (для режима «удерживать»)."""
-        return combo_keys(self.shown(name))
+        shown = self.shown(name)
+        return combo_keys(shown) if shown else []
 
     def shown(self, name: str) -> str:
-        """Комбинация для интерфейса: фактическая, а если не назначена — запрошенная."""
+        """Комбинация для интерфейса: фактическая, иначе запрошенная, иначе пусто."""
         return self.actual(name) or self.requested(name)
 
 

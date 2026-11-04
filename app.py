@@ -25,7 +25,8 @@ import calls
 from clipboard import set_text as set_clipboard_text
 from config import MODELS, MODEL_LABELS, Config
 import history
-from hotkeys import DEFAULT_COMBOS, HOTKEYS, hotkey_choices, parse_hotkey, probe_hotkey
+from hotkeys import (DEFAULT_COMBOS, DISABLED_LABEL, HOTKEYS, OPTIONAL_ACTIONS,
+                     hotkey_choices, is_disabled, normalize, parse_hotkey, probe_hotkey)
 from jobs import TranscriptionQueue
 import loopback
 from postprocess import apply_replacements, drop_fillers, tidy
@@ -47,6 +48,11 @@ DEFAULT_REPO = "vitrman/voice2text"
 
 # имя действия -> ключ настройки с его комбинацией
 _HOTKEY_CONFIG_KEYS = {"dictate": "hotkey", "show": "show_hotkey", "call": "call_hotkey"}
+
+
+def hotkey_text(name: str) -> str:
+    """Подпись хоткея для интерфейса: «отключён» вместо пустой строки."""
+    return HOTKEYS.shown(name) or "отключён"
 
 
 def _input_devices(all_variants: bool = False) -> list[str]:
@@ -149,6 +155,10 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None, on_call=None) -> 
 
     def register() -> None:
         for hotkey_id, name in ids:
+            if not HOTKEYS.requested(name):
+                HOTKEYS.set_actual(name, "")
+                trace(f"hotkey: {name} отключён")
+                continue
             registered = None
             for combo in HOTKEYS.candidates(name):
                 mods, vk = parse_hotkey(combo)
@@ -173,6 +183,12 @@ def start_hotkey_listener(on_dictate, on_show, on_status=None, on_call=None) -> 
         for hotkey_id, name in ids:
             requested = HOTKEYS.requested(name)
             previous = HOTKEYS.actual(name)
+            if not requested:
+                # действие отключили: снимаем прежнюю регистрацию, если она была
+                if previous:
+                    USER32.UnregisterHotKey(None, hotkey_id)
+                    HOTKEYS.set_actual(name, "")
+                continue
             if previous == requested or not probe_hotkey(requested):
                 continue
             mods, vk = parse_hotkey(requested)
@@ -694,7 +710,7 @@ class App:
         self.call_timer = ctk.CTkLabel(top, text="00:00", text_color=TEXT,
                                        font=ctk.CTkFont("Segoe UI", 22, "bold"))
         self.call_timer.pack(side="left", padx=(18, 12))
-        self.call_hint = ctk.CTkLabel(top, text=f"хоткей: {HOTKEYS.shown('call')}",
+        self.call_hint = ctk.CTkLabel(top, text=f"хоткей: {hotkey_text('call')}",
                                       text_color=MUTED, font=ctk.CTkFont("Segoe UI", 12))
         self.call_hint.pack(side="left")
 
@@ -797,14 +813,14 @@ class App:
 
         self._hotkey_entries: dict[str, object] = {}
         self._hotkey_choices = hotkey_choices()
-        self.var_hotkey = tk.StringVar(value=self._hotkey_value("dictate"))
+        self.var_hotkey = tk.StringVar(value=self._hotkey_display("dictate"))
         self._hotkey_menu("Хоткей диктовки", self.var_hotkey, "dictate")
-        self.var_show = tk.StringVar(value=self._hotkey_value("show"))
+        self.var_show = tk.StringVar(value=self._hotkey_display("show"))
         self._hotkey_menu("Хоткей окна", self.var_show, "show")
-        self.var_call_hotkey = tk.StringVar(value=self._hotkey_value("call"))
+        self.var_call_hotkey = tk.StringVar(value=self._hotkey_display("call"))
         self._hotkey_menu("Хоткей созвона", self.var_call_hotkey, "call")
         self.hotkey_note = self._panel_hint(
-            "Выберите комбинацию из списка. Занятая другой программой не применяется.")
+            "Выберите комбинацию из списка. Окно и созвон можно отключить.")
 
         self._panel_label("Режим хоткея")
         self.var_mode = tk.StringVar(value="удерживать" if self.config.get("hotkey_mode") == "hold"
@@ -940,13 +956,21 @@ class App:
 
     def _hotkey_value(self, name: str) -> str:
         """Сохранённая комбинация действия (или умолчание), всегда в нижнем регистре."""
-        value = (self.config.get(_HOTKEY_CONFIG_KEYS[name]) or "").strip().lower()
-        return value or DEFAULT_COMBOS[name]
+        value = normalize(self.config.get(_HOTKEY_CONFIG_KEYS[name]))
+        if value:
+            return value
+        return DEFAULT_COMBOS[name] if name == "dictate" else ""
+
+    def _hotkey_display(self, name: str) -> str:
+        """Что показывать в списке: комбинация или пункт «отключена»."""
+        return self._hotkey_value(name) or DISABLED_LABEL
 
     def _hotkey_menu(self, title: str, var: tk.StringVar, name: str) -> None:
         """Выпадающий список вместо свободного ввода и захвата клавиш хуком."""
         self._panel_label(title)
         choices = list(self._hotkey_choices)
+        if name in OPTIONAL_ACTIONS:
+            choices.insert(0, DISABLED_LABEL)   # «хоткея нет» — только для окна и созвона
         if var.get() and var.get() not in choices:
             choices.append(var.get())          # текущее значение всегда доступно
         box = ctk.CTkComboBox(self.settings_panel, values=choices, variable=var,
@@ -959,16 +983,25 @@ class App:
         self._hotkey_entries[name] = box
 
     def _on_hotkey_pick(self, name: str, var: tk.StringVar, combo: str) -> None:
-        combo = (combo or "").strip().lower()
+        combo = normalize(combo)
+        if not combo:
+            if name not in OPTIONAL_ACTIONS:      # диктовку отключить нельзя
+                var.set(self._hotkey_display(name))
+                self._hotkey_note_error("Без хоткея диктовки программой не управлять")
+                return
+            self.hotkey_note.configure(text="Хоткей отключён", text_color=MUTED)
+            self.status.set("Хоткей отключён")
+            self._schedule_apply()
+            return
         try:
             parse_hotkey(combo)
         except ValueError as exc:
-            var.set(self._hotkey_value(name))
+            var.set(self._hotkey_display(name))
             self._hotkey_note_error(f"Недопустимая комбинация: {exc}")
             return
         conflict = self._hotkey_conflict(name, combo)
         if conflict:
-            var.set(self._hotkey_value(name))
+            var.set(self._hotkey_display(name))
             self._hotkey_note_error(conflict)
             return
         self.hotkey_note.configure(text=f"Хоткей {combo} будет применён", text_color=MUTED)
@@ -1001,7 +1034,12 @@ class App:
         """
         requested = HOTKEYS.requested(name)
         entry = self._hotkey_entries.get(name)
-        if combo is None:
+        if not requested:
+            if entry is not None:
+                entry.configure(border_color=BORDER)
+            self.hotkey_note.configure(text="Хоткей отключён", text_color=MUTED)
+            self.status.set("Хоткей отключён")
+        elif combo is None:
             if entry is not None:
                 entry.configure(border_color="#e0554f")
             self.hotkey_note.configure(text=f"Не удалось назначить {requested}",
@@ -1032,10 +1070,12 @@ class App:
 
     def _apply_settings(self) -> None:
         self._apply_after = None
-        dict_combo = self.var_hotkey.get().strip().lower()
-        show_combo = self.var_show.get().strip().lower()
-        call_combo = self.var_call_hotkey.get().strip().lower()
-        for combo in (dict_combo, show_combo, call_combo):
+        dict_combo = normalize(self.var_hotkey.get())
+        show_combo = normalize(self.var_show.get())
+        call_combo = normalize(self.var_call_hotkey.get())
+        for name, combo in (("dictate", dict_combo), ("show", show_combo), ("call", call_combo)):
+            if not combo and name in OPTIONAL_ACTIONS:
+                continue                        # отключённый хоткей — допустимое значение
             try:
                 parse_hotkey(combo)
             except ValueError as exc:
@@ -1271,7 +1311,7 @@ class App:
         # у Windows 11 часто уезжает в переполнение «^», и окно было бы не вернуть
         self.root.iconify()
         trace("окно свёрнуто на панель задач")
-        self.events.put(("overlay", (f"Свёрнуто · {HOTKEYS.shown('show')} — открыть",
+        self.events.put(("overlay", (f"Свёрнуто · {hotkey_text('show')} — открыть",
                                      "#4caf50", 4000)))
 
     def _show_window(self) -> None:
@@ -1382,7 +1422,8 @@ class App:
             f"Каталог: {ROOT}\n"
             f"Лог: {LOG}\n"
             f"Микрофон: {self.config.get('device') or 'по умолчанию'}\n"
-            f"Хоткеи: {self.config['hotkey']} / {self.config['show_hotkey']}\n\n"
+            f"Хоткеи: {hotkey_text('dictate')} / {hotkey_text('show')} / "
+            f"{hotkey_text('call')}\n\n"
             f"--- последние строки лога ---\n{log_tail}"
         )
         self.root.clipboard_clear()
@@ -1398,7 +1439,7 @@ class App:
             f"GigaAM (Сбер), офлайн, русский язык\n"
             f"Модель: {self.engine.name}\n\n"
             f"Диктовка: {HOTKEYS.shown('dictate')}\n"
-            f"Показать окно: {HOTKEYS.shown('show')}",
+            f"Показать окно: {hotkey_text('show')}",
             parent=self.root)
 
     def _remember_own_hwnd(self) -> None:
@@ -1808,7 +1849,7 @@ class App:
                 bar.set(0)
         self.call_hint.configure(
             text="идёт запись — диктовка недоступна" if active
-            else f"хоткей: {HOTKEYS.shown('call')}")
+            else f"хоткей: {hotkey_text('call')}")
 
     def _call_log(self, text: str) -> None:
         self.call_log.insert("end", text + "\n")

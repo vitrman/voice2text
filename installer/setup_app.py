@@ -24,6 +24,7 @@ APP_TITLE = "Голосовой ввод"
 EXE_NAME = "Voice2Text.exe"
 UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}"
 CREATE_NO_WINDOW = 0x08000000
+MIN_WINDOWS = (10, 0)
 
 BG = "#121316"
 CARD = "#1b1d21"
@@ -33,6 +34,28 @@ ACCENT_HOVER = "#3d78e6"
 TEXT = "#f2f3f5"
 MUTED = "#8b9199"
 ERROR = "#e0554f"
+
+
+def windows_supported() -> bool:
+    """Приложение собрано на Python 3.12: Windows 7/8.1 не подходят.
+
+    Проверка стоит в установщике, чтобы вместо ошибок загрузки DLL вида
+    «python312.dll не найден» человек увидел понятное объяснение.
+    """
+    try:
+        return sys.getwindowsversion()[:2] >= MIN_WINDOWS
+    except Exception:
+        return True
+
+
+def unsupported_windows_text() -> str:
+    """Понятное объяснение вместо ошибок загрузки DLL на Windows 7/8.1."""
+    return (
+        "Программа работает только на Windows 10 и новее.\n\n"
+        "Установка отменена: на Windows 7/8.1 сборка не запустится — она сделана на "
+        "Python 3.12 и современных библиотеках (torch, onnxruntime), которым нужна "
+        "Windows 10 или 11 x64."
+    )
 
 
 def app_version() -> str:
@@ -360,7 +383,15 @@ class Setup(tk.Tk):
 
 def main() -> int:
     arguments = sys.argv[1:]
-    if any(arg.lower() in ("/s", "-s", "--silent") for arg in arguments):
+    silent = any(arg.lower() in ("/s", "-s", "--silent") for arg in arguments)
+    if not windows_supported():
+        # до tkinter не доходим: на старых системах важно успеть сказать причину
+        log_line("Windows старше 10 — установка отменена")
+        if not silent:
+            ctypes.windll.user32.MessageBoxW(None, unsupported_windows_text(),
+                                             "Требуется Windows 10", 0x00000010)
+        return 2
+    if silent:
         return run_silent(arguments)
     Setup().mainloop()
     return 0

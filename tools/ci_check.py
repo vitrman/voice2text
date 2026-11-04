@@ -40,6 +40,11 @@ def main() -> int:
     for name, default in hotkeys.DEFAULT_COMBOS.items():
         assert default in choices, f"умолчание {default} отсутствует в списке меню"
 
+    # окно и созвон можно отключить: пустая комбинация — это значение, а не ошибка
+    assert hotkeys.is_disabled("") and hotkeys.is_disabled(hotkeys.DISABLED_LABEL)
+    assert not hotkeys.is_disabled("ctrl+shift+w")
+    assert hotkeys.normalize(hotkeys.DISABLED_LABEL) == ""
+
     text = (ROOT / "version.py").read_text(encoding="utf-8")
     assert f'"{version.VERSION}"' in text
 

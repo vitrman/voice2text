@@ -14,7 +14,7 @@ from pathlib import Path
 
 from paths import DATA
 
-from hotkeys import parse_hotkey
+from hotkeys import normalize, parse_hotkey
 
 CONFIG_PATH = DATA / "config.json"
 
@@ -86,10 +86,17 @@ class Config(dict):
         if config.get("show_hotkey") == "ctrl+alt+w":
             config["show_hotkey"] = DEFAULTS["show_hotkey"]
             changed = True
-        # одиночные клавиши и мусор больше не поддерживаются: только комбинации
+        # одиночные клавиши и мусор больше не поддерживаются: только комбинации.
+        # диктовка обязательна, окно и созвон можно отключить (пустая строка)
         for key in ("hotkey", "show_hotkey", "call_hotkey"):
+            value = normalize(config.get(key))
+            if config.get(key) != value:
+                config[key] = value
+                changed = True
+            if not value and key != "hotkey":
+                continue
             try:
-                parse_hotkey(config.get(key) or "")
+                parse_hotkey(value)
             except ValueError:
                 config[key] = DEFAULTS[key]
                 changed = True

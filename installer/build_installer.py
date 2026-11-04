@@ -81,6 +81,16 @@ def main() -> int:
     setup_dir = OUT / name
     shutil.copy2(payload, setup_dir / "payload.zip")
     shutil.copy2(OUT / "version.txt", setup_dir / "version.txt")
+    (setup_dir / "ПРОЧТИ-МЕНЯ.txt").write_text(
+        "Голосовой ввод — требования\n"
+        "===========================\n\n"
+        "Нужна Windows 10 или 11 x64.\n\n"
+        "Windows 7 и 8.1 не поддерживаются: приложение собрано на Python 3.12 и\n"
+        "современных библиотеках (torch, onnxruntime). На этих системах установщик\n"
+        "либо покажет сообщение о требовании Windows 10, либо не запустится с\n"
+        "ошибкой загрузки python312.dll / api-ms-win-core-path-l1-1-0.dll —\n"
+        "это ожидаемо, установка на них невозможна.\n",
+        encoding="utf-8")
     setup_exe = setup_dir / f"{name}.exe"
     print(f"[3/3] Подпись {setup_exe.name}")
     sign = ROOT / "tools" / "sign.ps1"

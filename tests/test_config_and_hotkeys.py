@@ -98,10 +98,36 @@ def test_registry() -> None:
     print("состояние хоткеев: ок")
 
 
+def test_disabled_optional_hotkeys() -> None:
+    """Окно и созвон можно отключить: пустая комбинация сохраняется и не даёт кандидатов."""
+    path = fresh("cfg-disabled")
+    settings = Config()
+    settings["hotkey"] = "ctrl+shift+space"
+    settings["show_hotkey"] = ""
+    settings["call_hotkey"] = ""
+    settings.save(path)
+    loaded = Config.load(path)
+    assert loaded["show_hotkey"] == "" and loaded["call_hotkey"] == "", loaded
+    assert loaded["hotkey"] == "ctrl+shift+space"
+
+    registry = HotkeyRegistry()
+    assert registry.configure("ctrl+shift+space", "", "") is True
+    assert registry.requested("show") == "" and registry.actual("show") == ""
+    assert registry.shown("show") == ""
+    assert registry.candidates("show") == []
+    assert registry.spec("show") is None
+    assert registry.keys("show") == []
+    # диктовка обязательна: пустая комбинация заменяется запасной, а не отключает её
+    assert registry.configure("", "", "") is False
+    assert registry.requested("dictate") == "ctrl+shift+space"
+    print("отключённые хоткеи окна и созвона: ок")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_broken_primary_restores_backup()
     test_both_broken_gives_defaults()
     test_legacy_model_migrated()
     test_registry()
+    test_disabled_optional_hotkeys()
     print("все проверки настроек и хоткеев прошли")
