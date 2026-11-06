@@ -9,6 +9,8 @@ config.json.tmp
 history.log
 history.*.log
 last/
+# записи созвонов — личные данные, в git не попадают
+calls/
 
 # сборки и артефакты (пересобираются, в git не нужны)
 dist/

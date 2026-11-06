@@ -76,6 +76,12 @@ def main() -> int:
     results.append(started)
     print(f"{'ok  ' if started else 'FAIL'} созвон начат, кнопка «Завершить»")
 
+    # индикатор: плашка внизу экрана и таймер в заголовке окна
+    indicator = instance._overlay_phase == "call" and "СОЗВОН" in root.title()
+    results.append(indicator)
+    print(f"{'ok  ' if indicator else 'FAIL'} индикатор созвона: "
+          f"{instance._overlay_phase!r}, {root.title()!r}")
+
     meta_file = None
     if instance.call_session is not None:
         meta_file = instance.call_session / calls.META_FILE
@@ -96,6 +102,10 @@ def main() -> int:
     stopped = not instance.call_active and transcribed
     results.append(bool(stopped))
     print(f"{'ok  ' if stopped else 'FAIL'} стоп передаёт созвон на расшифровку")
+
+    cleared = instance._overlay_phase is None and "СОЗВОН" not in root.title()
+    results.append(cleared)
+    print(f"{'ok  ' if cleared else 'FAIL'} индикатор снят: {root.title()!r}")
 
     calls.CALLS_DIR = original_root
     shutil.rmtree(work, ignore_errors=True)

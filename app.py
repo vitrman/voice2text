@@ -624,7 +624,7 @@ class App:
     # ---------- UI ----------
     def _build_ui(self) -> None:
         ctk.set_appearance_mode("dark")
-        self.root.title(f"Голосовой ввод — GigaAM {VERSION}")
+        self.root.title(self._main_title())
         self.root.geometry("1240x720")
         self.root.minsize(980, 560)
         self.root.configure(fg_color=BG)
@@ -1204,13 +1204,19 @@ class App:
             trace(f"tray: недоступен: {exc}")
             return False
 
-        image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        # непрозрачная плашка: полупрозрачные иконки в трее выглядят пустыми
-        draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(79, 140, 255, 255))
-        draw.rounded_rectangle((26, 12, 38, 38), radius=6, fill=(255, 255, 255, 255))
-        draw.rectangle((30, 38, 34, 46), fill=(255, 255, 255, 255))
-        draw.rectangle((21, 46, 43, 51), fill=(255, 255, 255, 255))
+        def tray_image(color: tuple) -> "Image.Image":
+            """Иконка трея: синяя в покое, красная во время созвона."""
+            image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            # непрозрачная плашка: полупрозрачные иконки в трее выглядят пустыми
+            draw.rounded_rectangle((2, 2, 62, 62), radius=14, fill=color)
+            draw.rounded_rectangle((26, 12, 38, 38), radius=6, fill=(255, 255, 255, 255))
+            draw.rectangle((30, 38, 34, 46), fill=(255, 255, 255, 255))
+            draw.rectangle((21, 46, 43, 51), fill=(255, 255, 255, 255))
+            return image
+
+        self._tray_images = {"idle": tray_image((79, 140, 255, 255)),
+                             "call": tray_image((224, 85, 79, 255))}
 
         menu = pystray.Menu(
             pystray.MenuItem("Показать окно", lambda: self.events.put(("show", None)), default=True),
@@ -1220,7 +1226,7 @@ class App:
             pystray.MenuItem("Спрятать в трей", lambda: self.events.put(("hide_tray", None))),
             pystray.MenuItem("Выход", lambda: self.events.put(("quit", None))),
         )
-        self.icon = pystray.Icon("voice2text", image,
+        self.icon = pystray.Icon("voice2text", self._tray_images["idle"],
                                  f"Голосовой ввод — {HOTKEYS.shown('dictate')}", menu)
         threading.Thread(target=self.icon.run, kwargs={"setup": self._on_tray_ready},
                          daemon=True).start()
@@ -1230,6 +1236,43 @@ class App:
         """Вызывается pystray, когда иконка реально создана (иначе окно остаётся видимым)."""
         trace(f"tray: иконка создана, visible={getattr(icon, 'visible', None)}")
         self.events.put(("tray_ready", None))
+
+    # ---------- индикатор созвона в заголовке и трее ----------
+    def _main_title(self) -> str:
+        """Заголовок окна: во время созвона в нём виден таймер.
+
+        Забыть выключить созвон было легко: кнопка «Завершить» на другой вкладке,
+        а окно свёрнуто. Теперь состояние видно в панели задач и в трее.
+        """
+        base = f"Голосовой ввод — GigaAM {VERSION}"
+        if not self.call_active:
+            return base
+        elapsed = calls.format_time(time.monotonic() - self.call_started)
+        return f"● СОЗВОН {elapsed} — {base}"
+
+    def _update_title(self) -> None:
+        try:
+            self.root.title(self._main_title())
+        except tk.TclError:
+            pass
+
+    def _update_tray_title(self) -> None:
+        icon = getattr(self, "icon", None)
+        if icon is None:
+            return
+        images = getattr(self, "_tray_images", {})
+        try:
+            if self.call_active:
+                elapsed = calls.format_time(time.monotonic() - self.call_started)
+                icon.title = f"● Созвон {elapsed} — Голосовой ввод"
+                if "call" in images:
+                    icon.icon = images["call"]
+            else:
+                icon.title = f"Голосовой ввод — {hotkey_text('dictate')}"
+                if "idle" in images:
+                    icon.icon = images["idle"]
+        except Exception:            # pystray может не успеть создать иконку
+            pass
 
     # ---------- индикатор внизу экрана ----------
     def _build_overlay(self) -> None:
@@ -1306,6 +1349,26 @@ class App:
             self.overlay_after = None
         self._overlay_tick()
 
+    def _overlay_call(self) -> None:
+        """Постоянный индикатор созвона: пока запись идёт, плашка не исчезает.
+
+        Раньше единственным признаком был таймер на вкладке «Созвон», и забытый
+        созвон мог писать часами. Теперь таймер и подпись висят внизу экрана.
+        """
+        if self.overlay is None:
+            return
+        self._overlay_phase = "call"
+        self._overlay_started = time.monotonic()
+        self.overlay_dot.configure(fg=RECORD)
+        self.overlay_time.configure(text="0:00")
+        self.overlay_text.configure(text="созвон · идёт запись")
+        self._overlay_level(0)
+        self._overlay_place()
+        if self.overlay_after is not None:
+            self.root.after_cancel(self.overlay_after)
+            self.overlay_after = None
+        self._overlay_tick()
+
     def _overlay_processing(self, depth: int = 0) -> None:
         """Фаза распознавания: видно, что запись принята и сколько ещё в очереди."""
         if self.overlay is None:
@@ -1326,6 +1389,9 @@ class App:
         if self._overlay_phase == "recording":
             seconds = int(time.monotonic() - self._overlay_started)
             self.overlay_time.configure(text=f"{seconds // 60}:{seconds % 60:02d}")
+        elif self._overlay_phase == "call":
+            seconds = int(time.monotonic() - self._overlay_started)
+            self.overlay_time.configure(text=calls.format_time(seconds))
         else:
             self._overlay_dots = (self._overlay_dots + 1) % 4
             tail = "" if self._overlay_dots == 0 else "." * self._overlay_dots
@@ -1876,6 +1942,9 @@ class App:
             return
         seconds = int(time.monotonic() - self.call_started)
         self.call_timer.configure(text=calls.format_time(seconds))
+        self._update_title()
+        if seconds % 5 == 0:
+            self._update_tray_title()
         self._call_timer_after = self.root.after(1000, self._call_tick)
 
     def _set_call_state(self, active: bool) -> None:
@@ -1896,6 +1965,13 @@ class App:
         self.call_hint.configure(
             text="идёт запись — диктовка недоступна" if active
             else f"хоткей: {hotkey_text('call')}")
+        if active:
+            self._overlay_call()
+        else:
+            self._overlay_stop()
+            self._overlay_hide()
+        self._update_title()
+        self._update_tray_title()
 
     def _call_log(self, text: str) -> None:
         self.call_log.insert("end", text + "\n")
@@ -1938,9 +2014,9 @@ class App:
         target = filedialog.asksaveasfilename(
             title="Сохранить расшифровку",
             initialdir=str(calls.calls_dir()),
-            initialfile=f"созвон-{session.name}.md",
-            defaultextension=".md",
-            filetypes=[("Markdown", "*.md"), ("Текст", "*.txt")])
+            initialfile=f"созвон-{session.name}.txt",
+            defaultextension=".txt",
+            filetypes=[("Текст", "*.txt"), ("Все файлы", "*.*")])
         if not target:
             return
         try:
@@ -2066,9 +2142,12 @@ class App:
                                          parent=self.root)
                 elif kind == "call_level":
                     name, db = payload
+                    level = max(0.0, min(100.0, (db + 60) * 100 / 60))
                     bar = self.call_levels.get(name)
                     if bar is not None:
-                        bar.set(max(0.0, min(100.0, (db + 60) * 100 / 60)) / 100)
+                        bar.set(level / 100)
+                    if name == "mic" and self._overlay_phase == "call":
+                        self._overlay_level(level)
                 elif kind == "call_error":
                     self._on_call_error(payload)
                 elif kind == "call_recorded":

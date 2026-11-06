@@ -82,9 +82,11 @@ def main() -> int:
     print("транскрипт:")
     for line in transcript.splitlines():
         print("   ", line)
-    text_ok = "Я:" in transcript and "Собеседник:" in transcript and "[00:" in transcript
+    text_ok = ("Я:" in transcript and "Собеседник:" in transcript
+               and "[" not in transcript and "#" not in transcript
+               and transcript.startswith("Созвон"))
     results.append(text_ok)
-    print(f"{'ok  ' if text_ok else 'FAIL'} метки и время в транскрипте")
+    print(f"{'ok  ' if text_ok else 'FAIL'} метки и время в текстовом транскрипте")
     status_ok = state["status"] == "done" and len(state["segments"]) == 4
     results.append(status_ok)
     print(f"{'ok  ' if status_ok else 'FAIL'} состояние done, реплик 4")

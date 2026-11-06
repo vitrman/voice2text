@@ -13,7 +13,7 @@ MIC_FILE = "mic.wav"
 SYSTEM_FILE = "system.wav"
 META_FILE = "meta.json"
 STATE_FILE = "state.json"
-TRANSCRIPT_FILE = "transcript.md"
+TRANSCRIPT_FILE = "transcript.txt"
 
 SPEAKERS = {"me": "Я", "other": "Собеседник"}
 
@@ -83,9 +83,10 @@ def format_time(seconds: float) -> str:
 
 
 def render_transcript(meta: dict, state: dict) -> str:
+    """Простой текст без разметки: его удобно читать и вставлять в документы."""
     started = str(meta.get("started_local") or "")
     duration = float(meta.get("duration") or 0)
-    lines = [f"# Созвон {started}".rstrip()]
+    lines = [f"Созвон: {started}".rstrip(": ")]
     if duration:
         lines.append(f"Длительность: {format_time(duration)}")
     if meta.get("mic_device"):
@@ -98,7 +99,7 @@ def render_transcript(meta: dict, state: dict) -> str:
     for item in sorted(segments, key=lambda seg: (seg.get("start", 0), seg.get("index", 0))):
         who = SPEAKERS.get(item.get("speaker"), item.get("speaker"))
         stamp = format_time(float(item.get("start") or 0))
-        lines.append(f"- [{stamp}] {who}: {item['text']}")
+        lines.append(f"{stamp}  {who}: {item['text']}")
     return "\n".join(lines).strip() + "\n"
 
 
