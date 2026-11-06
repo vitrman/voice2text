@@ -1,32 +1,28 @@
+# окружение и кеши
 .venv/
 .cache/
-transcripts/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# пользовательские данные: настройки, история, записи созвонов
 config.json
 config.json.bak
 config.json.tmp
 history.log
 history.*.log
 last/
-# записи созвонов — личные данные, в git не попадают
+transcripts/
 calls/
+*.wav.tmp
 
 # сборки и артефакты (пересобираются, в git не нужны)
-dist/
-dist2/
-dist-dbg/
-dist-final/
-dist-installer/
-build/
-build2/
-build-dbg/
-build-final/
-build-installer/
+dist*/
+build*/
 torchinductor_vitrm/
 libs/
-*.log
 _MEI*/
+*.log
 
 # данные для тестов и модели
 .testdata*/
@@ -34,5 +30,6 @@ model/
 models/
 *.ckpt
 
-# скриншоты, которые тесты создают сами
-docs/overlay.png
+# скриншоты: в README нужен только главный экран, остальные рисуют тесты
+docs/*.png
+!docs/ui_main.png

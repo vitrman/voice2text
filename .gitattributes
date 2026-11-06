@@ -10,3 +10,4 @@
 *.png binary
 *.ico binary
 *.ckpt binary
+*.wav binary
