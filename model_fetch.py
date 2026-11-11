@@ -16,6 +16,9 @@ import urllib.request
 from pathlib import Path
 
 BASE = "https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM"
+# запасной источник: файлы моделей лежат в релизе репозитория (tools/upload_models.ps1)
+GITHUB_TAG = "models-v1"
+GITHUB_BASE = f"https://github.com/vitrman/voice2text/releases/download/{GITHUB_TAG}"
 HASHES = {
     "v3_e2e_rnnt": "2730de7545ac43ad256485a462b0a27a",
     "v3_e2e_ctc": "367074d6498f426d960b25f49531cf68",
@@ -27,6 +30,47 @@ CHUNK = 4 * 1024 * 1024
 
 class DownloadCancelled(RuntimeError):
     """Пользователь отменил скачивание модели (недокачанные куски остаются)."""
+
+
+class ModelDownloadError(RuntimeError):
+    """Ни один источник не отдал файл: сообщение для окна, без трейсбека."""
+
+
+def sources() -> list[str]:
+    """Источники по порядку: CDN Сбера, своё зеркало (env), GitHub Releases.
+
+    Своё зеркало задаётся VOICE2TEXT_MODEL_BASE — пригодится для локального
+    HTTP-сервера в сети, где GitHub и CDN недоступны.
+    """
+    ordered = [BASE]
+    mirror = os.environ.get("VOICE2TEXT_MODEL_BASE", "").strip().rstrip("/")
+    if mirror:
+        ordered.append(mirror)
+    ordered.append(GITHUB_BASE)
+    result: list[str] = []
+    for base in ordered:
+        if base not in result:
+            result.append(base)
+    return result
+
+
+def describe_error(exc: Exception) -> str:
+    """Короткая причина вместо простыни: чаще всего это TLS и время."""
+    text = str(exc) or exc.__class__.__name__
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return ("сертификат не принят — проверьте дату и время, обновите Windows "
+                "и корневые сертификаты")
+    if "timed out" in text.lower():
+        return "источник не ответил вовремя"
+    if "urlopen error" in text:
+        return text.split("urlopen error", 1)[1].strip(" <>:") or text
+    return text
+
+
+def _probe(url: str) -> int:
+    """Размер файла по HEAD; ошибки сети и TLS пробрасываются вызывающему."""
+    head = urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30)
+    return int(head.headers["Content-Length"])
 
 
 def md5(path: Path) -> str:
@@ -162,7 +206,21 @@ def _ensure_tokenizer(name: str, directory: Path, log) -> None:
             except OSError:
                 pass
     log(f"скачиваю токенизатор {name}")
-    urllib.request.urlretrieve(f"{BASE}/{name}_tokenizer.model", tokenizer)
+    problems: list[str] = []
+    for base in sources():
+        url = f"{base}/{name}_tokenizer.model"
+        try:
+            urllib.request.urlretrieve(url, tokenizer)
+            if tokenizer.exists() and tokenizer.stat().st_size > 1024:
+                return
+            problems.append(f"{base}: файл пустой")
+        except Exception as exc:
+            problems.append(f"{base}: {describe_error(exc)}")
+            log(f"токенизатор: {base} не отдал файл — {describe_error(exc)}")
+    raise ModelDownloadError(
+        f"Токенизатор {name} не скачался ни с одного источника:\n"
+        + "\n".join(problems)
+        + f"\nМожно положить файл {name}_tokenizer.model в {directory} вручную.")
 
 
 def ensure_model(name: str, directory: Path, workers: int = 8, progress=None, log=print,
@@ -180,19 +238,42 @@ def ensure_model(name: str, directory: Path, workers: int = 8, progress=None, lo
         log(f"чекпойнт {name} битый, перекачиваю")
         ckpt.unlink(missing_ok=True)
 
-    url = f"{BASE}/{name}.ckpt"
-    head = urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30)
-    size = int(head.headers["Content-Length"])
-    log(f"скачиваю модель {name}: {size / 1e6:.0f} МБ")
-
     part = ckpt.with_suffix(".part")
-    _download(url, part, size, workers, progress, log, cancel=cancel)
-    if not is_valid(part, name):
-        part.unlink(missing_ok=True)
+    problems: list[str] = []
+    for base in sources():
+        url = f"{base}/{name}.ckpt"
+        try:
+            size = _probe(url)
+        except Exception as exc:
+            problems.append(f"{base}: {describe_error(exc)}")
+            log(f"источник недоступен: {base} — {describe_error(exc)}")
+            continue
+        log(f"скачиваю модель {name}: {size / 1e6:.0f} МБ из {base}")
+        try:
+            _download(url, part, size, workers, progress, log, cancel=cancel)
+        except DownloadCancelled:
+            raise
+        except Exception as exc:
+            problems.append(f"{base}: {describe_error(exc)}")
+            log(f"скачивание сорвалось ({describe_error(exc)}), пробую следующий источник")
+            continue
+        if not is_valid(part, name):
+            # куски от сорвавшегося источника больше не годятся: начинаем заново
+            part.unlink(missing_ok=True)
+            part.with_suffix(".json").unlink(missing_ok=True)
+            problems.append(f"{base}: файл скачался с ошибкой (md5 не совпал)")
+            log("контрольная сумма не совпала, пробую следующий источник")
+            continue
+        part.replace(ckpt)
         part.with_suffix(".json").unlink(missing_ok=True)
-        raise RuntimeError(f"чекпойнт {name} скачался с ошибкой (md5 не совпал)")
-    part.replace(ckpt)
-    part.with_suffix(".json").unlink(missing_ok=True)
 
-    _ensure_tokenizer(name, directory, log)
-    return directory
+        _ensure_tokenizer(name, directory, log)
+        return directory
+
+    raise ModelDownloadError(
+        f"Модель {name} не скачалась ни с одного источника:\n"
+        + "\n".join(problems)
+        + "\n\nПроверьте дату и время, обновите Windows и корневые сертификаты, "
+          "затем запустите снова."
+          f"\nИли положите {name}.ckpt и {name}_tokenizer.model в {directory} вручную "
+          "(или задайте VOICE2TEXT_MODEL_DIR).")

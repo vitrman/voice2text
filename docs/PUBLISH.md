@@ -86,6 +86,20 @@ gh release create v0.7.3.1 dist-installer/Voice2Text-0.7.3.1-installer.zip \
   --title "Voice2Text 0.7.3.1" --notes-file CHANGELOG.md
 ```
 
+## Запасной источник моделей (один раз)
+
+Если CDN Сбера недоступен (частая причина — неверная дата/время или старые корневые
+сертификаты на клиенте), приложение берёт те же файлы из релиза GitHub с тегом
+`models-v1`. Тег задан в `model_fetch.GITHUB_TAG` — менять его нужно вместе с кодом.
+
+1. Убедиться, что модели лежат в кэше: `%LOCALAPPDATA%\voice2text\.cache\gigaam\`
+   (`v3_e2e_rnnt.ckpt`, `v3_e2e_rnnt_tokenizer.model`).
+2. Проверить без сети: `powershell -NoProfile -ExecutionPolicy Bypass -File tools\upload_models.ps1 -DryRun`
+3. Залить: тот же вызов без `-DryRun`. Токен берётся из сохранённого (см. выше) или
+   `-Token`. Второй моделью: `-Models v3_e2e_rnnt,v3_e2e_ctc`.
+4. Проверить: `https://github.com/<логин>/voice2text/releases/tag/models-v1` — оба файла
+   в Assets. Размер каждого до 2 ГБ (ограничение GitHub), чекпойнт 428 МБ проходит.
+
 ## 4. Проверить как пользователь
 
 1. Открыть `https://github.com/<логин>/voice2text/releases/latest`.

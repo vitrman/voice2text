@@ -57,14 +57,24 @@ def main() -> int:
     text = (ROOT / "version.py").read_text(encoding="utf-8")
     assert f'"{version.VERSION}"' in text
 
+    # запасной источник модели: сначала CDN, последним — релиз на GitHub
+    import model_fetch  # noqa: E402
+    order = model_fetch.sources()
+    assert order[0] == model_fetch.BASE, order
+    assert order[-1] == model_fetch.GITHUB_BASE, order
+    assert model_fetch.GITHUB_BASE.startswith("https://github.com/"), order
+    assert "сертификат не принят" in model_fetch.describe_error(
+        OSError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert version.VERSION in changelog, "нет записи о текущей версии в CHANGELOG.md"
 
     # powershell.exe (5.1) без BOM читает .ps1 как ANSI: русский текст ломается,
     # а скрипт публикации перестаёт разбираться синтаксически
-    script = ROOT / "tools" / "publish_release.ps1"
-    assert script.read_bytes().startswith(b"\xef\xbb\xbf"), (
-        "tools/publish_release.ps1 должен быть в UTF-8 с BOM")
+    for script_name in ("publish_release.ps1", "upload_models.ps1"):
+        script = ROOT / "tools" / script_name
+        assert script.read_bytes().startswith(b"\xef\xbb\xbf"), (
+            f"tools/{script_name} должен быть в UTF-8 с BOM")
 
     # атрибут вида self.capture = None перекрывает метод capture: именно так запись
     # перестала запускаться в 0.9.0.1 — поток стартовал с target=None

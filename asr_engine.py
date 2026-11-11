@@ -307,10 +307,15 @@ class GigaAMEngine:
         # битый или недокачанный чекпойнт gigaam не лечит — проверяем и качаем сами;
         # модель может уже лежать рядом с exe или в старом кэше, тогда берём её оттуда
         model_dir = MODEL_DIR
+        download_error = ""
         try:
-            from model_fetch import ensure_model
+            from model_fetch import ModelDownloadError, ensure_model
             target = self._name or CANDIDATES[0]
             model_dir = ensure_model(target, MODEL_DIR, progress=self._on_progress, log=self._log)
+        except ModelDownloadError as exc:
+            # без простыни трейсбека: человеку нужен понятный текст и что делать
+            download_error = str(exc)
+            self._log(f"модель не скачалась: {exc}")
         except Exception:
             self._log(f"подготовка модели не удалась:\n{traceback.format_exc()}")
 
@@ -328,7 +333,10 @@ class GigaAMEngine:
                 self._log(f"  не удалось: {exc}")
         if loaded is None:
             self._name = None
-            raise RuntimeError("Ни одна модель GigaAM не загрузилась:\n" + "\n".join(errors))
+            message = "Ни одна модель GigaAM не загрузилась:\n" + "\n".join(errors)
+            if download_error:
+                message = download_error + "\n\n" + message
+            raise RuntimeError(message)
         self._model = loaded
         self._name = loaded_name
         self.load_seconds = time.perf_counter() - started
