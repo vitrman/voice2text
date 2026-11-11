@@ -94,14 +94,19 @@ $existing = & curl.exe -sS -H $auth "$api/releases/tags/$Tag"
 try { $release = $existing | ConvertFrom-Json } catch { $release = $null }
 if (-not $release -or -not $release.id) {
     Write-Host "создаю релиз $Tag"
-    $body = @{
+    $what = @{
         tag_name = $Tag
         name = "Модели GigaAM v3 (резервный источник)"
         body = "Файлы моделей для запасного источника загрузки. Приложение берёт их, если CDN Сбера недоступен."
         draft = $false
         prerelease = $false
-    } | ConvertTo-Json -Compress
-    $created = & curl.exe -sS -X POST -H $auth -H "Content-Type: application/json" --data-binary $body "$api/releases"
+    }
+    # JSON кладём в файл: PowerShell съедает кавычки, если передавать строку
+    # аргументом нативному curl.exe — GitHub отвечает "Problems parsing JSON"
+    $jsonFile = Join-Path $env:TEMP "voice2text-release.json"
+    [IO.File]::WriteAllText($jsonFile, ($what | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    $created = & curl.exe -sS -X POST -H $auth -H "Content-Type: application/json" --data-binary "@$jsonFile" "$api/releases"
+    Remove-Item $jsonFile -ErrorAction SilentlyContinue
     $release = $created | ConvertFrom-Json
     if (-not $release.id) {
         Write-Host "не удалось создать релиз: $created" -ForegroundColor Red
@@ -123,7 +128,9 @@ foreach ($file in $files) {
     $answer = & curl.exe -sS -X POST -H $auth -H "Content-Type: application/octet-stream" `
         --data-binary "@$($file.Path)" `
         "https://uploads.github.com/repos/$Repo/releases/$($release.id)/assets?name=$($file.Name)"
-    if ($LASTEXITCODE -ne 0 -or $answer -notmatch '"id"') {
+    $asset = $null
+    try { $asset = $answer | ConvertFrom-Json } catch { $asset = $null }
+    if ($LASTEXITCODE -ne 0 -or -not $asset -or -not $asset.id) {
         Write-Host "ошибка загрузки $($file.Name): $answer" -ForegroundColor Red
         exit 1
     }
