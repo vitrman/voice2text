@@ -99,7 +99,10 @@ if (-not $release -or -not $release.id) {
         name = "Модели GigaAM v3 (резервный источник)"
         body = "Файлы моделей для запасного источника загрузки. Приложение берёт их, если CDN Сбера недоступен."
         draft = $false
-        prerelease = $false
+        # prerelease: иначе GitHub считает этот релиз «последним» и приложение
+        # ищет в нём установщик (ошибка «нет файла *-installer.zip»)
+        prerelease = $true
+        make_latest = "false"
     }
     # JSON кладём в файл: PowerShell съедает кавычки, если передавать строку
     # аргументом нативному curl.exe — GitHub отвечает "Problems parsing JSON"
@@ -112,6 +115,14 @@ if (-not $release -or -not $release.id) {
         Write-Host "не удалось создать релиз: $created" -ForegroundColor Red
         exit 1
     }
+} elseif (-not $release.prerelease) {
+    # релиз уже создан раньше без пометки — исправляем, иначе он ломает проверку обновлений
+    Write-Host "помечаю релиз $Tag как prerelease"
+    $jsonFile = Join-Path $env:TEMP "voice2text-release.json"
+    $patch = @{ prerelease = $true; make_latest = "false" } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($jsonFile, $patch, [Text.UTF8Encoding]::new($false))
+    $null = & curl.exe -sS -X PATCH -H $auth -H "Content-Type: application/json" --data-binary "@$jsonFile" "$api/releases/$($release.id)"
+    Remove-Item $jsonFile -ErrorAction SilentlyContinue
 }
 
 # 2) upload assets (skip names that already exist)

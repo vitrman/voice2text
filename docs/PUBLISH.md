@@ -99,6 +99,9 @@ gh release create v0.7.3.1 dist-installer/Voice2Text-0.7.3.1-installer.zip \
    `-Token`. Второй моделью: `-Models v3_e2e_rnnt,v3_e2e_ctc`.
 4. Проверить: `https://github.com/<логин>/voice2text/releases/tag/models-v1` — оба файла
    в Assets. Размер каждого до 2 ГБ (ограничение GitHub), чекпойнт 428 МБ проходит.
+   Релиз должен быть **prerelease** — скрипт ставит это сам (и исправляет уже
+   созданный). Обычный релиз GitHub считает последним, и приложение ищет в нём
+   установщик: «в релизе models-v1 нет файла *-installer.zip».
 
 ## 4. Проверить как пользователь
 

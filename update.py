@@ -31,6 +31,7 @@ import zipfile
 from pathlib import Path
 
 API = "https://api.github.com/repos/{repo}/releases/latest"
+RELEASES = "https://api.github.com/repos/{repo}/releases"
 USER_AGENT = "Voice2Text-updater"
 TIMEOUT = 20
 CHUNK = 1 << 20
@@ -98,14 +99,14 @@ def _sha_from_release(data: dict, asset: dict) -> str:
     return ""
 
 
-def fetch_latest(repo: str) -> dict:
-    """Последний опубликованный релиз: версия, ссылка, размер и sha256."""
-    with _request(API.format(repo=repo)) as response:
-        data = json.loads(response.read().decode("utf-8"))
-
+def _parse_release(data: dict) -> dict:
+    """Релиз с установщиком -> версия, ссылка, размер и sha256."""
     tag = str(data.get("tag_name") or data.get("name") or "").lstrip("vV")
     if not tag:
         raise UpdateError("в релизе нет тега версии")
+    # релиз с моделями (тег models-v1) — не версия программы, пропускаем
+    if not re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?", tag):
+        raise UpdateError(f"релиз {tag} — не версия программы")
 
     asset = None
     for item in data.get("assets") or []:
@@ -124,6 +125,33 @@ def fetch_latest(repo: str) -> dict:
         "sha256": _sha_from_release(data, asset),
         "page": data.get("html_url") or "",
     }
+
+
+def _release_list(repo: str) -> list[dict]:
+    with _request(RELEASES.format(repo=repo)) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def fetch_latest(repo: str) -> dict:
+    """Последний релиз с установщиком: версия, ссылка, размер и sha256.
+
+    `/releases/latest` может оказаться релизом моделей или черновиком без
+    установщика — тогда просматриваем список и берём первый подходящий.
+    """
+    try:
+        with _request(API.format(repo=repo)) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return _parse_release(data)
+    except UpdateError as first_error:
+        error = first_error
+
+    for data in _release_list(repo):
+        try:
+            return _parse_release(data)
+        except UpdateError:
+            continue
+    raise error
 
 
 def check(repo: str, current: str) -> dict | None:
