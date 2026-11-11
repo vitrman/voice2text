@@ -14,15 +14,32 @@ param(
     [string]$Repo = "vitrman/voice2text",
     [string]$Tag = "models-v1",
     [string]$Source = "",
-    [string[]]$Models = @("v3_e2e_rnnt"),
+    [string]$Models = "v3_e2e_rnnt",
     [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-if (-not $Source) {
-    $Source = Join-Path $env:LOCALAPPDATA "voice2text\.cache\gigaam"
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+# где искать файлы: указанная папка, кэш приложения или кэш внутри репозитория
+$searchDirs = @()
+if ($Source) {
+    $searchDirs = @($Source)
+} else {
+    $searchDirs = @(
+        (Join-Path $env:LOCALAPPDATA "voice2text\.cache\gigaam"),
+        (Join-Path $root ".cache\gigaam")
+    )
+}
+
+function Find-ModelFile([string]$name) {
+    foreach ($dir in $searchDirs) {
+        $candidate = Join-Path $dir $name
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return ""
 }
 
 $hashes = @{
@@ -47,11 +64,13 @@ function Get-StoredToken {
 if (-not $Token) { $Token = Get-StoredToken }
 
 $files = @()
-foreach ($model in $Models) {
+# -File не разбирает запятые в массивы: список приходит одной строкой
+$modelList = @($Models -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+foreach ($model in $modelList) {
     foreach ($suffix in @(".ckpt", "_tokenizer.model")) {
-        $file = Join-Path $Source ($model + $suffix)
-        if (-not (Test-Path $file)) {
-            Write-Host "нет файла: $file" -ForegroundColor Red
+        $file = Find-ModelFile ($model + $suffix)
+        if (-not $file) {
+            Write-Host "нет файла: $($model + $suffix) (искал в $($searchDirs -join '; '))" -ForegroundColor Red
             exit 1
         }
         $item = Get-Item $file
