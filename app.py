@@ -1302,9 +1302,12 @@ class App:
         self._overlay_phase = None        # None — обычное сообщение с TTL
         self._overlay_started = 0.0
         self._overlay_dots = 0
+        self._overlay_hover_after = None
         for widget in (self.overlay, frame, self.overlay_text, self.overlay_dot,
                        self.overlay_time, self.overlay_canvas):
             widget.bind("<Button-1>", lambda _e: self._show_window())
+            widget.bind("<Enter>", lambda _e: self._overlay_hover(True))
+            widget.bind("<Leave>", lambda _e: self._overlay_hover(False))
 
         self.overlay.update_idletasks()
         hwnd = USER32.GetAncestor(self.overlay.winfo_id(), 2) or self.overlay.winfo_id()
@@ -1320,10 +1323,48 @@ class App:
         # geometry у overrideredirect-окна применяется ненадёжно — ставим через WinAPI
         win32.place_window(self.overlay_hwnd, x, y, width, height)
 
+    def _overlay_alpha(self, value: float) -> None:
+        if self.overlay is None:
+            return
+        try:
+            self.overlay.attributes("-alpha", value)
+        except tk.TclError:
+            pass
+
+    def _overlay_reset_alpha(self) -> None:
+        """Новое сообщение всегда полностью видно, даже если курсор остался на плашке."""
+        if self._overlay_hover_after is not None:
+            try:
+                self.root.after_cancel(self._overlay_hover_after)
+            except Exception:
+                pass
+            self._overlay_hover_after = None
+        self._overlay_alpha(1.0)
+
+    def _overlay_hover(self, inside: bool) -> None:
+        """Под курсором плашка становится полупрозрачной — видно, что под ней.
+
+        Затемнение снимается с задержкой: без неё переход между подписями внутри
+        плашки (текст, таймер, полоска) мигал бы на каждом Enter/Leave.
+        """
+        if self.overlay is None:
+            return
+        if self._overlay_hover_after is not None:
+            try:
+                self.root.after_cancel(self._overlay_hover_after)
+            except Exception:
+                pass
+            self._overlay_hover_after = None
+        if inside:
+            self._overlay_alpha(0.5)
+        else:
+            self._overlay_hover_after = self.root.after(150, lambda: self._overlay_alpha(1.0))
+
     def _overlay_show(self, text: str, color: str = "#e05555", ttl_ms: int = 1500) -> None:
         """Короткое сообщение: «Вставлено», «Скопировано в буфер», ошибка."""
         if self.overlay is None:
             return
+        self._overlay_reset_alpha()
         self._overlay_phase = None
         self.overlay_time.configure(text="")
         self.overlay_text.configure(text=text)
@@ -1337,6 +1378,7 @@ class App:
         """Живой индикатор записи: таймер, фаза и уровень, без исчезновения по TTL."""
         if self.overlay is None:
             return
+        self._overlay_reset_alpha()
         self._overlay_phase = "recording"
         self._overlay_started = time.monotonic()
         self.overlay_dot.configure(fg=RECORD)
@@ -1357,6 +1399,7 @@ class App:
         """
         if self.overlay is None:
             return
+        self._overlay_reset_alpha()
         self._overlay_phase = "call"
         self._overlay_started = time.monotonic()
         self.overlay_dot.configure(fg=RECORD)
@@ -1373,6 +1416,7 @@ class App:
         """Фаза распознавания: видно, что запись принята и сколько ещё в очереди."""
         if self.overlay is None:
             return
+        self._overlay_reset_alpha()
         self._overlay_phase = "processing"
         self.overlay_dot.configure(fg="#e0a33a")
         self.overlay_time.configure(text="")
@@ -1416,6 +1460,7 @@ class App:
     def _overlay_hide(self) -> None:
         self.overlay_after = None
         if self.overlay is not None:
+            self._overlay_reset_alpha()      # следующее сообщение не должно быть бледным
             self.overlay.withdraw()
 
     def hide_to_tray(self) -> None:

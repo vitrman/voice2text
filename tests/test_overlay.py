@@ -57,6 +57,16 @@ def main() -> int:
     print(f"индикатор виден: {visible}")
     print(f"фокус не украден: {foreground_before == foreground_after}")
 
+    # под курсором плашка полупрозрачная, после ухода — снова полностью видимая
+    alpha_idle = float(instance.overlay.attributes("-alpha"))
+    instance._overlay_hover(True)
+    alpha_hover = float(instance.overlay.attributes("-alpha"))
+    instance._overlay_hover(False)
+    pump(root, 0.4)
+    alpha_back = float(instance.overlay.attributes("-alpha"))
+    print(f"прозрачность: {alpha_idle} -> {alpha_hover} -> {alpha_back}")
+    alpha_ok = (alpha_idle, alpha_hover, alpha_back) == (1.0, 0.5, 1.0)
+
     try:
         from PIL import ImageGrab
         ImageGrab.grab().save(ROOT / "docs" / "overlay.png")
@@ -69,7 +79,7 @@ def main() -> int:
     print("спрятан:", instance.overlay.state() == "withdrawn")
 
     instance._quit()
-    return 0 if visible else 1
+    return 0 if (visible and alpha_ok) else 1
 
 
 if __name__ == "__main__":
