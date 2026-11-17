@@ -29,6 +29,30 @@ for _directory in (MODEL_DIR, WAV_DIR):
 
 LOG_FILE = DATA / ".cache" / "asr.log"
 
+VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+
+
+def describe_import_error(exc: BaseException) -> str:
+    """Понятная причина, если torch не импортировался: чаще всего нет VC++ Runtime.
+
+    На чистой Windows 10 без Visual C++ Redistributable torch падает с
+    `[WinError 126] ... torch\\lib\\shm.dll`. После такой неудачи повторный
+    `import torch` в том же процессе невозможен, поэтому первый текст ошибки
+    запоминается и показывается дальше — иначе человек видит вторую, непонятную
+    («can only be initialized once»).
+    """
+    text = str(exc)
+    if ("shm.dll" in text or "WinError 126" in text or "DLL load failed" in text
+            or "Не найден указанный модуль" in text):
+        return ("Не загружается torch: не установлен Microsoft Visual C++ "
+                "Redistributable 2015–2022 (x64).\n"
+                f"Скачайте и установите: {VC_REDIST_URL}\n"
+                "Затем закройте и снова откройте программу.")
+    if "can only be initialized once" in text:
+        return ("torch не загрузился при старте и в этом запуске уже не загрузится. "
+                "Закройте программу и откройте заново.")
+    return f"Не удалось загрузить torch/gigaam: {text}"
+
 
 def _log(message: str) -> None:
     try:
@@ -266,6 +290,7 @@ class GigaAMEngine:
         # потока видели «модели нет» и грузили 428 МБ одновременно
         self._load_lock = threading.Lock()
         self.load_seconds = 0.0
+        self._load_failure = ""          # текст первой неудачи импорта torch
 
     @property
     def name(self) -> str:
@@ -283,14 +308,24 @@ class GigaAMEngine:
         """Освобождает модель: при смене модели в памяти оставался старый чекпойнт."""
         with self._load_lock:
             self._model = None
+            self._load_failure = ""
         import gc
 
         gc.collect()
 
     def _load(self) -> None:
         started = time.perf_counter()
-        import gigaam  # тяжёлый импорт: torch подтягивается здесь
-        import torch
+        if self._load_failure:
+            # повторный import torch в этом процессе всё равно не сработает:
+            # показываем первую (настоящую) причину, а не «initialized once»
+            raise RuntimeError(self._load_failure)
+        try:
+            import gigaam  # тяжёлый импорт: torch подтягивается здесь
+            import torch
+        except ImportError as exc:
+            self._load_failure = describe_import_error(exc)
+            self._log(f"torch не импортировался: {self._load_failure}")
+            raise RuntimeError(self._load_failure) from exc
 
         # одно ядро оставляем системе: иначе аудиопоток голодает, и в записи
         # появляются дыры (см. recorder: переполнение буфера)
